@@ -28,8 +28,10 @@ bl_info = {
 
 import bpy
 import os
+import json
+import re
 from bpy.props import (
-    BoolProperty, StringProperty, EnumProperty, FloatVectorProperty,
+    BoolProperty, StringProperty, EnumProperty, FloatVectorProperty, IntProperty,
 )
 from bpy.types import AddonPreferences, Operator
 from bpy_extras.io_utils import ImportHelper
@@ -42,6 +44,8 @@ if "importer" in locals():
     importlib.reload(i3d_attr_mapping)
     importlib.reload(i3d_shader_parser)
     importlib.reload(i3d_xml_parser)
+    importlib.reload(i3d_config_parser)
+    importlib.reload(i3d_config_preview)
     importlib.reload(i3d_shapes_reader)
     importlib.reload(i3d_shapes_models)
     importlib.reload(i3d_shapes_to_meshdata)
@@ -52,6 +56,8 @@ else:
     from . import i3d_attr_mapping
     from . import i3d_shader_parser
     from . import i3d_xml_parser
+    from . import i3d_config_parser
+    from . import i3d_config_preview
     from . import i3d_shapes_reader
     from . import i3d_shapes_models
     from . import i3d_shapes_to_meshdata
@@ -718,6 +724,24 @@ class FS25_OT_load_config_xml(Operator, ImportHelper):
                     setattr(settings, attr, current + ";{};;".format(abspath))
                     exporter_note = "; added to Giants exporter XML Config Files"
 
+        # Parse store configurations (designs, work areas, ...) for the in-Blender
+        # preview and stash them on the scene, keyed by import id. Applying the
+        # default option (index 0) reproduces the default store look.
+        try:
+            _cfg_types = i3d_config_parser.parse_configurations(self.filepath)
+            if _cfg_types:
+                _store = json.loads(context.scene.get('_i3d_storecfg', '{}'))
+                _types_d = i3d_config_parser.to_dict(_cfg_types)
+                _store[import_id] = {"types": _types_d,
+                                     "sel": {t["tag"]: 0 for t in _types_d}}
+                context.scene['_i3d_storecfg'] = json.dumps(_store)
+                _db = _fs25_data_base()
+                i3d_config_preview.capture_material_originals(import_id, _types_d)
+                for _t in _types_d:
+                    i3d_config_preview.apply_config(import_id, _t, 0, _db)
+        except Exception as _e:
+            self.report({'INFO'}, "Store-config preview not loaded: %r" % _e)
+
         if unmatched:
             # Nothing is silently lost: list the ids that found no matching object.
             # Most commonly these target a skinned bone/joint, which is not assigned
@@ -1177,6 +1201,93 @@ def _i3d_mapping_id_set(self, value):
     self["I3D_XMLconfigID"] = value
 
 
+def _fs25_data_base():
+    try:
+        return bpy.context.preferences.addons[__package__].preferences.fs25_data_base
+    except Exception:
+        return ""
+
+
+def _pretty_cfg_label(s):
+    """Make an l10n key or raw config label readable for the UI.
+
+    Base-game l10n keys (e.g. $l10n_configuration_valueUniversalShares) cannot be
+    resolved to their translation (the strings are not in the data files), so we
+    strip the key and split CamelCase: -> "Universal Shares".
+    """
+    if not s:
+        return "Option"
+    if s.startswith("$l10n_"):
+        s = s.split("value", 1)[1] if "value" in s else s.rsplit("_", 1)[-1]
+    s = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", s).strip()
+    return s or "Option"
+
+
+class FS25_OT_apply_store_config(Operator):
+    """Apply a store-configuration option to this import (visual preview only)."""
+    bl_idname = "fs25.apply_store_config"
+    bl_label = "Apply store config option"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    config_tag: StringProperty()
+    option_index: IntProperty()
+
+    def execute(self, context):
+        obj = context.active_object
+        import_id = obj.get('_i3d_import_id') if obj else None
+        if import_id is None:
+            self.report({'WARNING'}, "Select an imported object first.")
+            return {'CANCELLED'}
+        store = json.loads(context.scene.get('_i3d_storecfg', '{}'))
+        entry = store.get(import_id)
+        if not entry:
+            self.report({'WARNING'}, "No store config loaded for this import.")
+            return {'CANCELLED'}
+        ct = next((t for t in entry["types"] if t["tag"] == self.config_tag), None)
+        if ct is None:
+            return {'CANCELLED'}
+        entry["sel"][self.config_tag] = self.option_index
+        context.scene['_i3d_storecfg'] = json.dumps(store)
+        i3d_config_preview.apply_config(import_id, ct, self.option_index,
+                                       _fs25_data_base())
+        return {'FINISHED'}
+
+
+class FS25_PT_store_config(bpy.types.Panel):
+    """Store-configuration preview - switch design / work-area / etc. live."""
+    bl_idname = "FS25_PT_store_config"
+    bl_label = "Store Config (preview)"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "i3d Importer"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        obj = context.active_object
+        import_id = obj.get('_i3d_import_id') if obj else None
+        if import_id is None:
+            layout.label(text="Select an imported object", icon='INFO')
+            return
+        store = json.loads(context.scene.get('_i3d_storecfg', '{}'))
+        entry = store.get(import_id)
+        if not entry or not entry.get("types"):
+            layout.label(text="No store configurations loaded", icon='INFO')
+            layout.label(text="Use i3dMappings > Load Config XML")
+            return
+        for t in entry["types"]:
+            box = layout.box()
+            box.label(text=_pretty_cfg_label(t["name"]))
+            sel = entry["sel"].get(t["tag"], 0)
+            col = box.column(align=True)
+            for i, opt in enumerate(t["options"]):
+                op = col.operator("fs25.apply_store_config",
+                                  text=_pretty_cfg_label(opt["label"]),
+                                  depress=(i == sel))
+                op.config_tag = t["tag"]
+                op.option_index = i
+
+
 def register():
     bpy.utils.register_class(FS25_OT_terrain_base_color_reset)
     bpy.utils.register_class(FS25I3DImporterPreferences)
@@ -1188,6 +1299,7 @@ def register():
     bpy.utils.register_class(FS25_OT_invisible_ge_hide)
     bpy.utils.register_class(FS25_OT_sync_debug_to_export_material)
     bpy.utils.register_class(FS25_OT_load_config_xml)
+    bpy.utils.register_class(FS25_OT_apply_store_config)
     bpy.types.Object.i3d_importer_mapping_id = StringProperty(
         name="Mapping ID", get=_i3d_mapping_id_get, set=_i3d_mapping_id_set)
     bpy.utils.register_class(FS25_PT_i3d_importer_panel)
@@ -1200,6 +1312,7 @@ def register():
     bpy.utils.register_class(FS25_PT_invisible_ge_objects)
     bpy.utils.register_class(FS25_PT_material_settings)
     bpy.utils.register_class(FS25_PT_debug_view)
+    bpy.utils.register_class(FS25_PT_store_config)
     bpy.types.Scene.fs25_debug_mode = EnumProperty(
         name="FS25 Debug Mode",
         description="Show the standard material, a mask, or vertex colors",
@@ -1238,6 +1351,7 @@ def unregister():
     del bpy.types.Scene.fs25_tree_season
     del bpy.types.Scene.fs25_debug_only_active
     del bpy.types.Scene.fs25_debug_mode
+    bpy.utils.unregister_class(FS25_PT_store_config)
     bpy.utils.unregister_class(FS25_PT_debug_view)
     bpy.utils.unregister_class(FS25_PT_material_settings)
     bpy.utils.unregister_class(FS25_PT_invisible_ge_objects)
@@ -1245,6 +1359,7 @@ def unregister():
     bpy.utils.unregister_class(FS25_PT_i3d_importer_panel)
     del bpy.types.Object.i3d_importer_mapping_id
     bpy.utils.unregister_class(FS25_OT_load_config_xml)
+    bpy.utils.unregister_class(FS25_OT_apply_store_config)
     bpy.utils.unregister_class(FS25_OT_sync_debug_to_export_material)
     bpy.utils.unregister_class(FS25_OT_invisible_ge_hide)
     bpy.utils.unregister_class(FS25_OT_invisible_ge_show)
