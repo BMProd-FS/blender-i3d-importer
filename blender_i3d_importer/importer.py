@@ -348,6 +348,9 @@ def import_i3d(i3d_filepath: str, report: Callable = None,
         # i3D_mergeGroup/i3D_mergeGroupRoot properties on the objects.
         _process_merge_groups(import_collection, shape_map, shape_id_to_obj, _report)
         _process_merge_children(import_collection, shape_map, shape_id_to_obj, _report)
+        # Round-trip fixpoint (#37): collapse any '<joint>_skin' bone TGs
+        # from a previous export back onto their joints before re-wrapping.
+        _strip_skin_reexport_tgs(import_collection, shape_map, shape_id_to_obj, _report)
         _process_skin_weights(import_collection, shape_map, shape_id_to_obj, _report)
         _process_skin_bindings(import_collection, _report)
 
@@ -373,10 +376,6 @@ def import_i3d(i3d_filepath: str, report: Callable = None,
         # and deforms the skinned mesh at rest - #6).
         _finalize_skin_childof(import_collection, _report)
 
-        # Re-parent chained skin joints (bind joint under bind joint) via real
-        # bone parenting now that axis correction has finalized the bone rests
-        # (Giants exporter chain support; see _process_skin_weights stash).
-        _finalize_skin_chains(import_collection, _report)
 
         # apply hide AFTER axis correction. hide_set matches the H
         # shortcut (view-layer eye). On Giants re-export this leads to
@@ -510,14 +509,23 @@ def _strip_sort_prefix(name):
 
 
 def _collect_skinweight_excluded_ids(nodes, excluded):
-    """Collect nodeIds of skin-weights shapes and their bind-target bones so
-    they are NOT given a sort-order prefix. The Giants exporter breaks the
-    skin/armature linkage when these nodes are renamed: the joint icon is lost
-    and the bones export as plain TransformGroups (confirmed empirically, see
-    GitHub #13 / #6). Skin-weights is distinguished from a merge group by the
-    rule (verified against base-game files): a skin-weights shape's own nodeId
-    is NOT the first entry of skinBindNodeIds, whereas a merge-group root lists
-    itself first. Merge groups are therefore left prefixed."""
+    """Collect nodeIds of skin-weights SHAPES (only the mesh, NOT its bind
+    joints) so they are NOT given a sort-order prefix.
+
+    The bind joints must now KEEP the prefix: since #37 they stay in the
+    hierarchy as plain TransformGroups (the bone that skins the mesh is a
+    separate "<joint>_skin" node), and their sibling order is only reproduced on
+    re-export when they carry the sort key. Prefixing the joint no longer breaks
+    the skin linkage (the exporter keys skinning by armature+bone name, and the
+    bone name is derived from the STRIPPED joint name), unlike the old model
+    where the joint itself became the bone (#13 / #6).
+
+    The skin mesh shape itself is left unprefixed conservatively (its safety
+    under prefixing is still to be confirmed by round-trip QA). Skin-weights is
+    distinguished from a merge group by the rule (verified against base-game
+    files): a skin-weights shape's own nodeId is NOT the first entry of
+    skinBindNodeIds, whereas a merge-group root lists itself first. Merge groups
+    are therefore left prefixed."""
     for n in nodes:
         sb = (n.raw_attrs or {}).get("skinBindNodeIds")
         if sb:
@@ -526,8 +534,7 @@ def _collect_skinweight_excluded_ids(nodes, excluded):
             except ValueError:
                 ids = []
             if ids and ids[0] != n.nodeId:        # skin-weights, not merge group
-                excluded.add(n.nodeId)
-                excluded.update(ids)
+                excluded.add(n.nodeId)            # only the skin mesh shape
         if n.children:
             _collect_skinweight_excluded_ids(n.children, excluded)
 
@@ -2586,98 +2593,6 @@ def _compute_xml_world_translation(obj):
     return pos
 
 
-def _finalize_skin_chains(import_collection, report):
-    """Re-create joint CHAINS (a bind joint parented to another bind joint, e.g.
-    HW180V9) via real bone parenting, AFTER axis correction has finalized the
-    bone rests. The Giants exporter only honours bone parenting for chains
-    (boneHasParentBone, i3d_export.py:1523) and computes the child relative to
-    the parent bone, so the correct rest depends on the post-axis parent bone
-    matrix. _process_skin_weights stashed the per-chain plan (child bone, parent
-    bone, matrix_exp) on the armature as '_i3d_chainfix'. We set:
-
-        child.matrix = parent_bone.matrix @ Rx(90) @ matrix_exp @ Rx(-90)
-
-    Because bakeTransformMatrix distributes over products and Rx(90)/Rx(-90)
-    cancel inside it, the exporter then emits exactly matrix_exp's translation
-    and rotation - the joint's original local transform. Processing parents
-    before children telescopes multi-level chains (the parent's own correction
-    cancels). Verified by HW180V9 round-trip."""
-    import bpy as _bpy
-    import json as _json
-    from mathutils import Matrix as _Mat
-    _Rx90 = _Mat.Rotation(math.radians(90), 4, 'X')
-    _Rxm90 = _Mat.Rotation(math.radians(-90), 4, 'X')
-
-    for arm_obj in [o for o in import_collection.objects if o.type == 'ARMATURE']:
-        raw = arm_obj.get('_i3d_chainfix')
-        if not raw:
-            continue
-        try:
-            plan = _json.loads(raw)
-        except Exception:
-            del arm_obj['_i3d_chainfix']
-            continue
-        # child bone name -> (parent bone name, matrix_exp)
-        entry = {cbn: (pbn, _Mat([m[0:4], m[4:8], m[8:12], m[12:16]]))
-                 for cbn, pbn, m in plan}
-        # parent-before-child order
-        ordered, placed, rem = [], set(), list(entry)
-        while rem:
-            progress = False
-            for cbn in list(rem):
-                pbn = entry[cbn][0]
-                if pbn not in entry or pbn in placed:
-                    ordered.append(cbn); placed.add(cbn); rem.remove(cbn)
-                    progress = True
-            if not progress:
-                ordered.extend(rem)  # cycle guard - should not happen
-                break
-        prev_active = _bpy.context.view_layer.objects.active
-        _bpy.context.view_layer.objects.active = arm_obj
-        _bpy.ops.object.mode_set(mode='EDIT')
-        try:
-            ad = arm_obj.data
-            for cbn in ordered:
-                pbn, mexp = entry[cbn]
-                if cbn == pbn:
-                    continue
-                ceb = ad.edit_bones.get(cbn)
-                peb = ad.edit_bones.get(pbn)
-                if ceb is None or peb is None:
-                    continue
-                newm = peb.matrix @ _Rx90 @ mexp @ _Rxm90
-                # A NaN/inf in an edit-bone matrix crashes Blender natively, so
-                # validate before assigning - a joint with a degenerate or
-                # zero-scale transform can produce one.
-                if not all(math.isfinite(c) for r in newm for c in r):
-                    report('WARNING',
-                           f"chained skin joint {cbn!r}: non-finite bone matrix "
-                           f"- left unparented")
-                    continue
-                # Refuse cyclic parenting (would also crash Blender).
-                _anc, _cyclic = peb, False
-                while _anc is not None:
-                    if _anc == ceb:
-                        _cyclic = True
-                        break
-                    _anc = _anc.parent
-                if _cyclic:
-                    continue
-                ceb.use_connect = False
-                ceb.parent = peb
-                ceb.matrix = newm
-        finally:
-            _bpy.ops.object.mode_set(mode='OBJECT')
-        if prev_active is not None:
-            try:
-                _bpy.context.view_layer.objects.active = prev_active
-            except Exception:
-                pass
-        del arm_obj['_i3d_chainfix']
-        report('INFO',
-               f"{arm_obj.name}: re-parented {len(ordered)} chained skin joint(s)")
-
-
 def _finalize_skin_childof(import_collection, report):
     """Set the proper Child-Of inverse on skin-wrapper bones and unmute them,
     AFTER _apply_axis_correction has baked X+90 into the armature's bone rest
@@ -2722,36 +2637,124 @@ def _finalize_skin_childof(import_collection, report):
             pass
 
 
+def _strip_skin_reexport_tgs(import_collection, shape_map, shape_id_to_obj, report):
+    """Collapse re-export skin bone TGs back onto their joints (round-trip
+    fixpoint for #37).
+
+    When a file we previously exported is re-imported, each skin mesh's
+    skinBindNodeIds point at the "<joint>_skin" TransformGroups the Giants
+    exporter created from our wrapper bones (a new last child of each joint), NOT
+    at the original joints. Left untouched, _process_skin_weights would wrap
+    those again ("<joint>_skin_skin") and the nesting would grow one level per
+    round-trip. This pass detects a bind node whose (sort-prefix-stripped) name
+    ends with "_skin" and which is a childless Empty/TransformGroup, rewrites the
+    mesh's skinBindNodeIds entry to the node's PARENT (the real joint) and removes
+    the "_skin" TG. Removing a childless last-child shifts no sibling index."""
+    import bpy as _bpy
+    import re as _re
+
+    node_id_to_obj = {}
+    for obj in import_collection.objects:
+        nid = obj.get('_i3d_nodeId')
+        if nid is not None:
+            try:
+                node_id_to_obj[int(nid)] = obj
+            except (TypeError, ValueError):
+                pass
+
+    _skin_re = _re.compile(r"_skin(?:\.\d+)?$")
+
+    to_remove = set()          # objects to delete after all meshes processed
+    collapsed = 0
+
+    for shape_id, shape in shape_map.items():
+        if not shape.is_armature_skin:
+            continue
+        mesh_obj = shape_id_to_obj.get(shape_id)
+        if mesh_obj is None:
+            continue
+        raw = mesh_obj.get('_i3d_skinBindNodeIds_raw', '')
+        try:
+            bind_ids = [int(x) for x in str(raw).split() if x.strip()]
+        except ValueError:
+            continue
+        if not bind_ids:
+            continue
+
+        changed = False
+        new_ids = []
+        for nid in bind_ids:
+            obj = node_id_to_obj.get(nid)
+            if (obj is not None
+                    and obj.type == 'EMPTY'
+                    and not obj.children
+                    and _skin_re.search(_strip_sort_prefix(obj.name))):
+                parent = obj.parent
+                pnid = None
+                if parent is not None:
+                    try:
+                        pnid = int(parent.get('_i3d_nodeId'))
+                    except (TypeError, ValueError):
+                        pnid = None
+                if pnid is not None:
+                    new_ids.append(pnid)
+                    to_remove.add(obj)
+                    changed = True
+                    continue
+                report('WARNING',
+                       f"{mesh_obj.name}: skin bone TG {obj.name!r} has no "
+                       f"resolvable parent joint - left as-is")
+            new_ids.append(nid)
+
+        if changed:
+            mesh_obj['_i3d_skinBindNodeIds_raw'] = ' '.join(str(i) for i in new_ids)
+
+    for obj in to_remove:
+        name = obj.name
+        try:
+            _bpy.data.objects.remove(obj, do_unlink=True)
+            collapsed += 1
+        except Exception as e:
+            report('WARNING', f"could not remove skin bone TG {name!r}: {e}")
+
+    if collapsed:
+        report('INFO',
+               f"skin round-trip: collapsed {collapsed} '_skin' bone TG(s) "
+               f"back onto their joint(s)")
+
+
 def _process_skin_weights(import_collection, shape_map, shape_id_to_obj, report):
     """For Skin-Weights shapes (4 weighted bones per vertex), reproduce the
     original embedded-joint hierarchy on re-export through the Giants exporter
-    (#6). Strategy:
+    (#6 / #37). Strategy:
 
+      - The original bind-joint Empties STAY in the hierarchy at their original
+        sibling position (they keep the sort-order prefix, their i3dMappings and
+        <animations> index paths, and their own userAttributes, e.g. liw). They
+        are NOT removed and their children are NOT reparented.
       - Build ONE shared armature named "zzz_armature" - a plain name (NO ':'
-        sort-prefix). The Giants exporter's skin bone-map keys bones by the
-        armature's *exported* name (i3d_export.py mapSkinning); a stripped ':'
-        name would not match the bone fullPathName, so skinBindNodeIds would
-        silently NOT be generated. 'zzz' sorts the (empty) leftover armature TG
-        LAST so the user can find & delete it. Parented to the scene root.
+        sort-prefix); the Giants exporter's skin bone-map keys bones by the
+        armature's *exported* name (mapSkinning), so a stripped ':' name would
+        silently break skinBindNodeIds. 'zzz' sorts the armature TG LAST.
       - One bone per UNIQUE bind joint (deduped by nodeId across all skin
-        meshes). Each bone is positioned at the joint's world transform and
-        given a Child-Of constraint targeting the joint's ORIGINAL PARENT, so
-        the Giants exporter places the bone (as a TransformGroup) back under
-        that parent. skinBindNodeIds is rebuilt by the exporter from each
-        mesh's vertex groups -> bones, pointing at the correctly placed joints.
-      - The original joint Empties are REMOVED (the bone replaces the joint),
-        so there is no duplicate node / name collision.
-      - Any userAttributes on the removed joints (notably liw=true) cannot be
-        carried by a bone through the Giants exporter, so they are preserved as
-        a JSON marker on the armature object and can be restored in the Giants
-        Editor afterwards (see userAttribute_string_liwNodes /
-        _jointOriginalNodeIds on the armature).
+        meshes), named "<jointname>_skin". Each bone sits on its joint's world
+        transform and gets a Child-Of constraint targeting the joint ITSELF, so
+        the Giants exporter emits the bone as a TransformGroup that is a NEW LAST
+        child of the joint (getBoneIndex = len(target.children)). A new last
+        child shifts no existing sibling index, so all Mod-XML index paths stay
+        valid - the fix for #37.
+      - In-game the animation moves the joint (the mapping points at it) and the
+        bone TG hangs beneath it and follows, so the skinned vertices follow.
 
-    NOTE: bone transforms (Child-Of relative placement + axis-correction
-    interaction) must be verified in a re-export / in-game test.
+    Re-import fixpoint: on re-importing a re-exported i3d the skinBindNodeIds
+    point at the "<joint>_skin" TGs; _strip_skin_reexport_tgs() collapses each
+    back onto its parent joint, so no extra nesting level accumulates.
+
+    NOTE: the Child-Of / axis-correction interaction is verified by re-export /
+    in-game test (bp2140e, HW180V9).
     """
     import bpy as _bpy
-    from mathutils import Vector as _Vec, Matrix as _Mat, Euler as _Eul
+    from mathutils import Vector as _Vec, Matrix as _Mat
 
     # Flush pending transforms so source_obj.matrix_world is up to date.
     _bpy.context.view_layer.update()
@@ -2796,39 +2799,22 @@ def _process_skin_weights(import_collection, shape_map, shape_id_to_obj, report)
                 seen.add(nid)
                 unique_joint_ids.append(nid)
 
-    # Resolve joints -> source empty, capturing parent + userAttributes BEFORE
-    # the empties are removed.
-    joint_info = {}   # nid -> {'src','name','parent','ua'}
+    # Resolve joints -> source empty. The joints STAY, so we only need src+name.
+    joint_info = {}   # nid -> {'src','name'}
     missing = []
     for nid in unique_joint_ids:
         src = node_id_to_obj.get(nid)
         if src is None:
             missing.append(nid)
             continue
-        ua = {k: src[k] for k in src.keys() if k.startswith('userAttribute_')}
         joint_info[nid] = {
             'src': src,
             'name': _strip_sort_prefix(src.name),
-            'parent': src.parent,
-            'ua': ua,
         }
     if missing:
         report('WARNING',
                f"skin-weights: bind nodes not found: {missing} - "
                f"those slots get a placeholder bone at origin")
-
-    # Detect joint CHAINS: a bind joint whose original parent is itself a bind
-    # joint (HW180V9 has 22). These must be re-created via bone PARENTING, not a
-    # Child-Of to the parent joint Empty - the Giants exporter parents a bone to
-    # its parent bone when boneHasParentBone is true (i3d_export.py:1523), and it
-    # ignores the Child-Of bone subtarget, so a Child-Of-to-bone would be lost.
-    obj_to_nid = {info['src']: nid for nid, info in joint_info.items()
-                  if info and info['src'] is not None}
-    chained_parent_nid = {}   # child joint nid -> parent joint nid
-    for _nid, _info in joint_info.items():
-        _pnid = obj_to_nid.get(_info['parent'])
-        if _pnid is not None:
-            chained_parent_nid[_nid] = _pnid
 
     orig_active = _bpy.context.view_layer.objects.active
 
@@ -2848,7 +2834,8 @@ def _process_skin_weights(import_collection, shape_map, shape_id_to_obj, report)
     try:
         for nid in unique_joint_ids:
             info = joint_info.get(nid)
-            base_name = info['name'] if info else f"__skin_missing_{nid}"
+            base_name = (f"{info['name']}_skin" if info
+                         else f"__skin_missing_{nid}")
             name = base_name
             suffix = 1
             while name in used_names:
@@ -2886,107 +2873,26 @@ def _process_skin_weights(import_collection, shape_map, shape_id_to_obj, report)
                 bone.head = head_local
                 bone.tail = bone.head + y_axis * 0.1
                 bone.align_roll(z_axis)
-
-        # Joint chains (a bind joint parented to another bind joint, e.g.
-        # HW180V9 has 22): the Giants exporter re-creates a chain only via real
-        # bone PARENTING (boneHasParentBone, i3d_export.py:1523), and it then
-        # computes the child RELATIVE TO THE PARENT BONE. The correct bone rest
-        # therefore depends on the parent bone matrix AFTER the X+90 axis
-        # correction that runs later, so we cannot set it here. Instead stash
-        # each chained joint's invariant local transform (relative to its parent
-        # joint) NOW, while the joint Empties still exist, and apply the
-        # parenting + reverse-engineered rest in _finalize_skin_chains() after
-        # axis correction. matrix_exp = src.matrix_local @ Rx(90) is the matrix
-        # the exporter must end up computing for this node (the post-pass sets
-        # child.matrix = parent_bone.matrix @ Rx(90) @ matrix_exp @ Rx(-90),
-        # which makes the exporter emit the original local translation/rotation;
-        # verified by round-trip on HW180V9).
-        _chainfix = []
-        for _nid, _pnid in chained_parent_nid.items():
-            _cbn = bone_name_of.get(_nid)
-            _pbn = bone_name_of.get(_pnid)
-            _info = joint_info.get(_nid)
-            _src = _info['src'] if _info else None
-            if not _cbn or not _pbn or _src is None:
-                continue
-            # matrix_exp must be the matrix the exporter ends up decomposing.
-            # The exporter does to_euler('XYZ') then subtracts 90 from the X
-            # euler, so we need to_euler(matrix_exp) == (rxml.x + 90, y, z).
-            # A plain `matrix_local @ Rx(90)` is WRONG at gimbal lock (|Y|==90):
-            # Blender 'XYZ' euler is Rz@Ry@Rx, so a left/right Rx(90) does not
-            # simply add 90 to the X euler there. Build it from the euler so it
-            # is exact even at |Y|==90 (verified on HW180V9's +/-90deg joints).
-            # Recover the raw Y-up XML rotation: the joint TG was imported with
-            # rot = M @ R_xml @ M^-1 (M = Rx(90)); undo the conjugation.
-            _M3 = _Mat.Rotation(math.radians(90), 3, 'X')
-            _rxml = (_M3.inverted() @ _src.matrix_local.to_3x3() @ _M3).to_euler('XYZ')
-            _mexp = (_Mat.Translation(_src.matrix_local.to_translation())
-                     @ _Eul((_rxml.x + math.radians(90), _rxml.y, _rxml.z),
-                            'XYZ').to_matrix().to_4x4())
-            if not all(math.isfinite(_c) for _row in _mexp for _c in _row):
-                # Degenerate joint transform -> would crash on bone.matrix set.
-                report('WARNING',
-                       f"skin joint {_cbn!r}: degenerate local transform - "
-                       f"chain re-parenting skipped")
-                continue
-            _chainfix.append([_cbn, _pbn, [c for _row in _mexp for c in _row]])
-        if _chainfix:
-            import json as _json
-            arm_obj['_i3d_chainfix'] = _json.dumps(_chainfix)
     finally:
         _bpy.ops.object.mode_set(mode='OBJECT')
 
     _bpy.context.view_layer.update()
 
-    # ---- Child-Of constraints: each bone -> joint's original parent ----
+    # ---- Child-Of constraints: each bone -> its OWN joint ----
     # Created MUTED. The proper "Set Inverse" is done in _finalize_skin_childof()
     # AFTER axis correction: _apply_axis_correction bakes X+90 into the
     # armature's bone rest, which would invalidate an inverse computed now and
     # leave the constraint non-neutral (skinned mesh deformed at rest, #6).
     for nid in unique_joint_ids:
         info = joint_info.get(nid)
-        if not info or info['parent'] is None:
+        if not info or info['src'] is None:
             continue
-        if nid in chained_parent_nid:
-            continue  # parented via bone hierarchy (chain), not Child-Of
         pb = arm_obj.pose.bones.get(bone_name_of[nid])
         if pb is None:
             continue
         con = pb.constraints.new('CHILD_OF')
-        con.target = info['parent']
+        con.target = info['src']
         con.mute = True
-
-    # ---- Preserve removed-joint userAttributes (e.g. liw) on the armature ----
-    preserved = {}
-    for nid in unique_joint_ids:
-        info = joint_info.get(nid)
-        if info and info['ua']:
-            preserved[info['name']] = info['ua']
-    if preserved:
-        # Encode XML-safe: the Giants exporter writes attribute values RAW
-        # (no escaping), so the value must not contain '"', '<', '>' or '&'.
-        # Plain comma/colon-delimited lists of joint names + ids only.
-        # Restore in GE by joint name (joints keep their original name).
-        liw_names = [n for n, ua in preserved.items()
-                     if ua.get('userAttribute_boolean_liw')]
-        if liw_names:
-            arm_obj['userAttribute_string_liwNodes'] = ','.join(liw_names)
-        # Stable-id fallback: "jointName:origNodeId" pairs.
-        id_pairs = [f"{n}:{ua['userAttribute_integer_originalNodeId']}"
-                    for n, ua in preserved.items()
-                    if 'userAttribute_integer_originalNodeId' in ua]
-        if id_pairs:
-            arm_obj['userAttribute_string_jointOriginalNodeIds'] = ','.join(id_pairs)
-        # Warn if a joint carried attributes beyond liw/originalNodeId so
-        # nothing is silently lost (none expected for standard FS assets).
-        _known_ua = {'userAttribute_boolean_liw',
-                     'userAttribute_integer_originalNodeId'}
-        for n, ua in preserved.items():
-            extra = [k for k in ua if k not in _known_ua]
-            if extra:
-                report('WARNING',
-                       f"joint {n!r} had extra userAttribute(s) not preserved "
-                       f"on the armature: {extra}")
 
     # ---- Per-mesh: armature modifier + vertex groups + weights ----
     for shape_id, shape, mesh_obj, bind_ids in skin_meshes:
@@ -3023,61 +2929,12 @@ def _process_skin_weights(import_collection, shape_map, shape_id_to_obj, report)
                 weight_count += 1
 
         report('INFO',
-               f"{mesh_obj.name}: skinned to shared 'armature' "
+               f"{mesh_obj.name}: skinned to shared 'zzz_armature' "
                f"({len(vg_map)} bone(s), {weight_count} weight(s))")
 
-    # ---- Remove the now-duplicate source joint Empties ----
-    # Joint Empties can be parented to OTHER bind joints (joint chains, e.g.
-    # HW180V9 has 22 of them). We must NOT reparent a child onto a captured
-    # joint.parent that is itself a joint scheduled for removal: if that parent
-    # joint is removed first, the reference goes stale and `child.parent =
-    # <removed>` raises "StructRNA of type Object has been removed", aborting
-    # the whole import before axis correction runs (#29 - the mesh then stays
-    # Y-up / 90 deg off). So resolve every reparent target to the nearest
-    # ancestor that is NOT a joint being removed, and snapshot the full plan
-    # BEFORE deleting anything.
-    joint_objs = {info['src'] for info in joint_info.values()
-                  if info and info['src'] is not None}
-
-    def _surviving_ancestor(obj):
-        p = obj.parent
-        while p is not None and p in joint_objs:
-            p = p.parent
-        return p
-
-    # (child, target_parent, world_matrix). Only non-joint children need
-    # reparenting; child joints are removed in this same pass. Targets are
-    # non-joint survivors, so they never go stale during the removals below.
-    reparent_plan = []
-    for info in joint_info.values():
-        src = info['src'] if info else None
-        if src is None:
-            continue
-        target = _surviving_ancestor(src)
-        for child in src.children:
-            if child in joint_objs:
-                continue
-            reparent_plan.append((child, target, child.matrix_world.copy()))
-
-    for child, target, mw in reparent_plan:
-        child.parent = target
-        child.matrix_world = mw
-
-    removed = 0
-    for nid in unique_joint_ids:
-        info = joint_info.get(nid)
-        if not info or info['src'] is None:
-            continue
-        src = info['src']
-        try:
-            _bpy.data.objects.remove(src, do_unlink=True)
-            removed += 1
-        except Exception as e:
-            report('WARNING', f"could not remove joint empty {src.name!r}: {e}")
-
     report('INFO',
-           f"skin-weights: shared 'armature' with {len(unique_joint_ids)} "
-           f"joint-bone(s); removed {removed} duplicate joint empt(y/ies)")
+           f"skin-weights: shared 'zzz_armature' with {len(unique_joint_ids)} "
+           f"joint-bone(s); {len(joint_info)} joint(s) kept in place")
 
     if orig_active is not None:
         try:
