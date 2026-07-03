@@ -97,6 +97,8 @@ def import_i3d(i3d_filepath: str, report: Callable = None,
                build_pbr_debug_materials: bool = True,
                attach_debug_materials_to_mesh: bool = False,
                add_sort_order_prefix: bool = True,
+               frame_view: bool = True,
+               configure_exporter: bool = True,
                terrain_lod: str = 'OFF',
                terrain_base_color=(0.03434, 0.042311, 0.012286, 1.0),
                terrain_poc_layer_names: str = "ASPHALT,GRASS,MUD,FOREST_LEAVES,FOREST_GRASS",
@@ -402,7 +404,7 @@ def import_i3d(i3d_filepath: str, report: Callable = None,
         # auto-hide so view_selected ignores hidden objects, and BEFORE the
         # deselect block (which cleanly resets selection afterwards).
         try:
-            _post_import_view_setup(import_collection, _report)
+            _post_import_view_setup(import_collection, _report, frame_view=frame_view)
         except Exception as e:
             _report('INFO', f"Post-import view setup skipped: {e}")
 
@@ -437,33 +439,34 @@ def import_i3d(i3d_filepath: str, report: Callable = None,
         #   - i3D_exportUseSoftwareFileName=False so the "Use Blender Filename"
         #     checkbox is off and exportFileLocation takes effect
         #   - i3D_exportFileLocation = EXPORT_DIR + basename of the imported i3d
-        try:
-            settings = bpy.context.scene.I3D_UIexportSettings
-            # FS25 10.0.x exporter registers lowercase i3D_* UI field names,
-            # FS22 9.1.0 uses uppercase I3D_* (same field stems, same scene
-            # group I3D_UIexportSettings). Pick whichever casing the installed
-            # exporter actually has, otherwise the first assignment raises
-            # AttributeError on FS22 and the whole setup is skipped silently.
-            pfx = 'i3D_' if hasattr(settings, 'i3D_gameLocationDisplay') else 'I3D_'
-            setattr(settings, pfx + 'gameLocationDisplay',
-                    FS25_DATA_BASE.rstrip("\\/") + "\\")
-            setattr(settings, pfx + 'exportUseSoftwareFileName', False)
-            if EXPORT_DIR:
-                setattr(settings, pfx + 'exportFileLocation',
-                        str(Path(EXPORT_DIR) / i3d.name))
+        if configure_exporter:
+            try:
+                settings = bpy.context.scene.I3D_UIexportSettings
+                # FS25 10.0.x exporter registers lowercase i3D_* UI field names,
+                # FS22 9.1.0 uses uppercase I3D_* (same field stems, same scene
+                # group I3D_UIexportSettings). Pick whichever casing the installed
+                # exporter actually has, otherwise the first assignment raises
+                # AttributeError on FS22 and the whole setup is skipped silently.
+                pfx = 'i3D_' if hasattr(settings, 'i3D_gameLocationDisplay') else 'I3D_'
+                setattr(settings, pfx + 'gameLocationDisplay',
+                        FS25_DATA_BASE.rstrip("\\/") + "\\")
+                setattr(settings, pfx + 'exportUseSoftwareFileName', False)
+                if EXPORT_DIR:
+                    setattr(settings, pfx + 'exportFileLocation',
+                            str(Path(EXPORT_DIR) / i3d.name))
+                    _report('INFO',
+                            f"Giants exporter configured ({pfx}): "
+                            f"gameLocation={FS25_DATA_BASE}, exportFile={i3d.name}")
+                else:
+                    _report('INFO',
+                            "Export Directory in the Giants i3d Exporter was not set "
+                            "due to missing preference setting for export directory")
+                    _report('INFO',
+                            f"Giants exporter gameLocation set to: {FS25_DATA_BASE}")
+            except AttributeError:
                 _report('INFO',
-                        f"Giants exporter configured ({pfx}): "
-                        f"gameLocation={FS25_DATA_BASE}, exportFile={i3d.name}")
-            else:
-                _report('INFO',
-                        "Export Directory in the Giants i3d Exporter was not set "
-                        "due to missing preference setting for export directory")
-                _report('INFO',
-                        f"Giants exporter gameLocation set to: {FS25_DATA_BASE}")
-        except AttributeError:
-            _report('INFO',
-                    "Giants i3d Exporter not installed - "
-                    "skipping export property setup")
+                        "Giants i3d Exporter not installed - "
+                        "skipping export property setup")
 
         # Total imported objects: meshes (shapes) + curves (splines) +
         # empties (TransformGroup/Reference/...) + lights + cameras.
@@ -3706,7 +3709,7 @@ def _apply_axis_correction(top_level_objs, report):
               if skipped_count else "."))
 
 
-def _post_import_view_setup(import_collection, report):
+def _post_import_view_setup(import_collection, report, frame_view=True):
     """After import: switch all 3D Viewports to Material Preview shading,
     frame the imported objects (Numpad-. equivalent), and bump the viewport
     clip-end to 10000 when any imported object exceeds 500 units in either
@@ -3740,19 +3743,22 @@ def _post_import_view_setup(import_collection, report):
             # Stale wrapper (deleted by merge-groups pass etc.) - skip.
             continue
 
-    # 2. Select all imported objects (visible ones). select_set on hidden
+    # 2. Select all imported objects (visible ones) to drive view_selected.
+    #    Skipped entirely when frame_view is False (e.g. referenced wheel/rim
+    #    sub-imports must not move the user's viewport). select_set on hidden
     #    objects raises RuntimeError; that is fine, we swallow it.
-    try:
-        bpy.ops.object.select_all(action='DESELECT')
-    except RuntimeError:
-        pass
     any_selected = False
-    for obj in import_collection.all_objects:
+    if frame_view:
         try:
-            obj.select_set(True)
-            any_selected = True
-        except (ReferenceError, RuntimeError):
-            continue
+            bpy.ops.object.select_all(action='DESELECT')
+        except RuntimeError:
+            pass
+        for obj in import_collection.all_objects:
+            try:
+                obj.select_set(True)
+                any_selected = True
+            except (ReferenceError, RuntimeError):
+                continue
 
     # 3. Per View3D area: shading + clip_end. Then per area frame the
     #    selection via view_selected (one region override per area).

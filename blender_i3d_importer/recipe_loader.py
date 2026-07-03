@@ -1264,12 +1264,15 @@ def build_pbr_debug_material(
             fid = int(fid_str)
         except ValueError:
             continue
-        # detailNormal is a normal map (Non-Color), detailDiffuse is sRGB.
-        # Pragmatic: set non_color=True for all "*Normal" custommaps.
-        _is_normal = cm_name.endswith('Normal') or cm_name.endswith('normalMap')
+        # Colour maps (diffuse/albedo/emissive) load as sRGB; every other custom
+        # map is data and must be Non-Color, or its channels are gamma-distorted.
+        # This covers detailSpecular (glossmap: R=smoothness, G=AO, B=metalness)
+        # and data masks, not only normal maps.
+        _is_data = not any(k in cm_name.lower()
+                           for k in ("diffuse", "albedo", "emissive"))
         cm_node = _make_image_chain(
             nt, fid, scene, i3d_dir,
-            texture_name=cm_name, label=cm_name, non_color=_is_normal,
+            texture_name=cm_name, label=cm_name, non_color=_is_data,
             location_x=-1300, y_offset=y_offset,
             uv_mapping=uv_mapping,
             image_cache=image_cache,
@@ -1282,6 +1285,9 @@ def build_pbr_debug_material(
         )
         if cm_node is None:
             continue
+        # Mark detail/custom-map texture nodes so the store-config preview can
+        # find and swap them for texture-based material templates (Design Line).
+        cm_node.name = "fs25_tex:" + cm_name
         cm_tex[cm_name] = cm_node
         y_offset -= 300
         cm_count += 1

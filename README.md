@@ -52,6 +52,16 @@ modify, and (mostly) round-trip back into the Giants Editor through the Giants i
 - Optional Y-up → Z-up bake at import 
 - Auto-hide objects flagged `visibility="false"` or `nonRenderable="true"` (matches the Giants Editor render-view behavior)
 
+### Store configurations & wheels (preview) — new in 0.5
+
+- **Store Config panel** — load a vehicle/placeable config XML and switch its store configurations right in Blender, like in the in-game shop: designs, motor variants, attacher options, folding presets, solar panels on buildings, and more. Object changes are applied game-exact (visibility, translation/rotation/scale, including one-sided changes that fall back to the node's original state) plus per-option material swaps.
+- **Configuration sets** — the shop's preset chooser (e.g. working-width presets) pins all controlled sub-configurations at once.
+- **Wheels** — wheel configurations load the real tires, rims, hubs and wheel weights from the shared tire/rim files, resolved exactly like the game does it (baseConfig inheritance, per-wheel overrides, dimension-generated configs, direct-filename wheels). Includes tire-brand selection per configuration and a **None** button that removes all loaded wheel parts again — the cleanest state for a re-export, since the game loads wheels dynamically anyway.
+- **Twin wheels** — additional wheels including their discs and both connector types (rimDual cage and hubDual clamps), with the connector geometry baked shader-exact.
+- **Shader-exact rims** — the FS rim shader sizes and dishes every rim procedurally from a `widthAndDiam` parameter; the preview bakes that deformation into the mesh (and *Prepare for Export* restores the pristine mesh + writes the parameter onto the export material, so GE and the game deform it themselves).
+- **Rim color preview** — recolor rims/weights per the vehicle's rimColor configurations; painting follows the shapes-file material slot names, so parts that stay black in-game stay black here too.
+- Known gap: the color configurations (base/design color palettes incl. the generated default colors) have no picker yet — coming as the next feature block.
+
 ### N-panel workflow tools (`N` in the 3D viewport, tab "i3d Importer")
 
 - **Material Switch** — toggle the selected meshes between debug and re-export materials
@@ -61,6 +71,8 @@ modify, and (mostly) round-trip back into the Giants Editor through the Giants i
 - **FS25 Invisible GE-objects** — show/hide all objects that were auto-hidden because they are invisible in the Giants Editor (e.g. collision volumes); reminds you to un-hide them before re-export
 - **Tree Season** - for imported trees, switch the seasonal leaf debug look (Summer / Autumn / Winter / Spring); appears only when a tree-branch material is present in the scene
 - **i3dMappings** - load a vehicle/placeable config XML and assign its `<i3dMapping>` ids to the imported objects, then view and edit a node's **Mapping ID** (written so the Giants exporter picks it up on re-export); also fills the exporter's *XML Config Files* list so you only pick the file once
+- **Store Config (preview)** - after loading the config XML: switch store configurations, load wheel configurations with tire brand and rim color, apply configuration-set presets; **Show All Config Parts** and **Default Config** reset buttons included
+- **Prepare for Export** - one click gets the scene export-ready: shows snow/GE-invisible parts, resets the config preview, restores pristine (un-baked) wheel meshes, switches everything to the re-export materials and writes the rim/connector shader parameters onto them
 
 ### Convenience after import
 
@@ -130,11 +142,12 @@ See [`blender_i3d_importer/patches/README.md`](blender_i3d_importer/patches/READ
 
 Vehicle and placeable config XMLs reference nodes in the i3d through an `<i3dMappings>` block, which lives in the XML, not in the i3d. After import, open the **i3dMappings** box in the i3d Importer tab, click **Load Config XML**, and pick the matching `vehicle.xml` / `placeable.xml`: the importer assigns each mapping id to the right object and fills the exporter's *XML Config Files* list. You can then view and edit a node's **Mapping ID** in the same box - this works around a Giants exporter bug on Blender 5.1+ where the exporter's own field cannot set a custom id. See the [i3dMappings wiki page](https://github.com/nadine-brinkmann/blender-i3d-importer/wiki/i3dMappings).
 
-**Before re-export, remember:**
+**Before re-export:** click **Prepare for Export** (top of the i3d Importer tab) — it un-hides snow/GE-invisible parts, resets the store-config preview, restores the pristine wheel meshes, switches every imported mesh to its re-export material and writes the rim/connector shader parameters. In detail, that covers what used to be manual steps:
 
 - If you used the **Material Settings** sliders, click **Sync to Export Material** so the changes are persisted on the export materials.
 - If you used the **Snow + Ice** or **Invisible GE-objects** hide toggles, un-hide them — the Giants Exporter writes `visibility="false"` to the XML based on the Outliner eye state.
 - If you used the **Material Switch** to Debug, switch back to Export (debug materials carry extra preview nodes that are not round-trip-clean).
+- If you loaded **wheels** just for the preview, click **None** in the Wheels section first — the game loads wheels dynamically at runtime, so an export without them avoids duplicate static wheels and keeps the `<i3dMappings>` index paths identical to the original XML.
 
 ## Known limitations
 
@@ -142,6 +155,8 @@ Vehicle and placeable config XMLs reference nodes in the i3d through an `<i3dMap
 - **Reference-node recursion.** Sub-i3ds referenced by a node are not loaded automatically; they remain as empties with the original `i3D_referenceFilename` custom property. The Giants exporter writes them back correctly on re-export, but only if you apply the `referenceChildPath`-patch (see above).
 - **Skinned-mesh armature leftover.** Re-exporting a skinned mesh leaves one empty `armature` transform group in the scenegraph (the Giants exporter does not collapse armatures). It is harmless and can be deleted in the Giants Editor; the joints themselves round-trip to their original place via "Child Of" constraints.
 - **i3dMappings on bones are not assigned.** When you load a config XML, mappings that target a skinned bone/joint (rare) are not assigned to any object; the importer lists them in a warning so nothing is lost silently. All mappings that target regular objects, including merge-group members, are assigned.
+- **Color configurations have no picker yet.** Base/design color palettes (including the game-generated default colors and `useBaseColor` references) are not offered in the Store Config panel yet — planned as the next feature block.
+- **Merge groups bound to distant nodes.** A rare merge-group pattern whose bind nodes live elsewhere in the tree (e.g. the detached coupler hoses on some sprayers) is not distributed yet and clumps at the origin; the game replaces those visuals at runtime anyway.
 
 ## License and attribution
 

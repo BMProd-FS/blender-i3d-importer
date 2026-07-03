@@ -30,6 +30,8 @@ import bpy
 import os
 import json
 import re
+import shutil
+from pathlib import Path
 from bpy.props import (
     BoolProperty, StringProperty, EnumProperty, FloatVectorProperty, IntProperty,
 )
@@ -44,8 +46,12 @@ if "importer" in locals():
     importlib.reload(i3d_attr_mapping)
     importlib.reload(i3d_shader_parser)
     importlib.reload(i3d_xml_parser)
+    importlib.reload(i3d_material_templates)
     importlib.reload(i3d_config_parser)
     importlib.reload(i3d_config_preview)
+    importlib.reload(i3d_reference_loader)
+    importlib.reload(i3d_wheel_resolver)
+    importlib.reload(i3d_wheel_loader)
     importlib.reload(i3d_shapes_reader)
     importlib.reload(i3d_shapes_models)
     importlib.reload(i3d_shapes_to_meshdata)
@@ -56,8 +62,12 @@ else:
     from . import i3d_attr_mapping
     from . import i3d_shader_parser
     from . import i3d_xml_parser
+    from . import i3d_material_templates
     from . import i3d_config_parser
     from . import i3d_config_preview
+    from . import i3d_reference_loader
+    from . import i3d_wheel_resolver
+    from . import i3d_wheel_loader
     from . import i3d_shapes_reader
     from . import i3d_shapes_models
     from . import i3d_shapes_to_meshdata
@@ -163,6 +173,15 @@ class FS25I3DImporterPreferences(AddonPreferences):
                     "before re-export when this flag is on.",
         default=False,
     )
+    auto_load_config_xml: BoolProperty(
+        name="Load XML with the same name automatically if present",
+        description="After importing an .i3d, if a config XML with the same name "
+                    "exists in the same folder (e.g. vario1000.xml next to "
+                    "vario1000.i3d), load it automatically: assign its i3dMappings "
+                    "and load the store-config preview. Saves picking the file by "
+                    "hand.",
+        default=False,
+    )
     add_sort_order_prefix_default: BoolProperty(
         name="Add GE sort-order prefix by default",
         description="Default for the operator checkbox 'Add GE sort-order "
@@ -224,6 +243,7 @@ class FS25I3DImporterPreferences(AddonPreferences):
         box.prop(self, "build_pbr_debug_materials_default")
         box.prop(self, "attach_debug_materials_to_mesh_default")
         box.prop(self, "add_sort_order_prefix_default")
+        box.prop(self, "auto_load_config_xml")
 
         box = layout.box()
         box.label(text="Terrain", icon='WORLD')
@@ -388,6 +408,7 @@ class IMPORT_OT_fs25_i3d(Operator, ImportHelper):
             return {'CANCELLED'}
 
         try:
+            _before = set(bpy.data.objects)
             count, warnings = importer.import_i3d(
                 self.filepath, report=self.report,
                 apply_axis_correction=self.apply_axis_correction,
@@ -406,6 +427,19 @@ class IMPORT_OT_fs25_i3d(Operator, ImportHelper):
                 self.report({'INFO'}, f"FS25 i3d Import: {count} object(s) imported ({warnings} warning(s) - see log)")
             else:
                 self.report({'INFO'}, f"FS25 i3d Import: {count} object(s) imported")
+            # Optional: auto-load a same-named config XML next to the .i3d.
+            if prefs.auto_load_config_xml:
+                _xml = os.path.splitext(self.filepath)[0] + ".xml"
+                if os.path.isfile(_xml):
+                    _new_id = next(
+                        (o.get('_i3d_import_id') for o in bpy.data.objects
+                         if o not in _before and o.get('_i3d_import_id')), None)
+                    if _new_id:
+                        try:
+                            _apply_config_xml(context, _new_id, _xml, self.report)
+                        except Exception as _e:
+                            self.report({'INFO'},
+                                        "Auto config XML load skipped: %r" % _e)
             return {'FINISHED'}
         except Exception as e:
             self.report({'ERROR'}, f"Import failed: {e}")
@@ -567,99 +601,264 @@ def _serialize_param_group(slots):
     return ' '.join(f"{v:.6f}" for v in components)
 
 
+def _sync_debug_material(mat):
+    """Push one debug material's fs25_param:* node values to its paired export
+    material's customParameter_* IDProperties. Returns (export_name, n_synced,
+    n_skipped) or None when there is no usable debug material / export pair."""
+    if mat is None or mat.get('_i3d_material_kind') != 'debug':
+        return None
+    mid = mat.get('_i3d_material_id')
+    uuid = mat.get('_i3d_import_uuid')
+    if mid is None or not mat.use_nodes or mat.node_tree is None:
+        return None
+    pair = None
+    for m in bpy.data.materials:
+        if (m.get('_i3d_material_id') == mid
+                and m.get('_i3d_import_uuid') == uuid
+                and m.get('_i3d_material_kind') == 'export'):
+            pair = m
+            break
+    if pair is None:
+        return None
+    prefix = 'fs25_param:'
+    groups = {}
+    for node in mat.node_tree.nodes:
+        if not node.name.startswith(prefix):
+            continue
+        slider_name = node.name[len(prefix):]
+        xml_param = node.get('fs25_xml_param')
+        if xml_param is None:
+            xml_param = slider_name
+        xml_slot = node.get('fs25_xml_slot') or 'all'
+        mode = node.get('fs25_serialize')
+        if mode is None:
+            if node.type == 'RGB':
+                mode = 'rgba'
+            elif node.type == 'VALUE':
+                mode = 'float'
+            else:
+                continue
+        groups.setdefault(xml_param, {})[xml_slot] = (node, mode)
+    n_synced = n_skipped = 0
+    for xml_param, slots in groups.items():
+        try:
+            serialized = _serialize_param_group(slots)
+        except Exception:
+            n_skipped += 1
+            continue
+        if serialized is None:
+            n_skipped += 1
+            continue
+        pair['customParameter_' + xml_param] = serialized
+        n_synced += 1
+    # Detail textures swapped by a material config (e.g. Design Line chrome): the
+    # fs25_tex:<role> node carries the canonical $data path -> write the export
+    # material's customTexture_<role>. Unswapped nodes have no path, so the export
+    # keeps its original texture.
+    for node in mat.node_tree.nodes:
+        if not node.name.startswith('fs25_tex:'):
+            continue
+        dp = node.get('fs25_data_path')
+        if dp:
+            role = node.name[len('fs25_tex:'):]
+            pair['customTexture_' + role] = dp
+            n_synced += 1
+    return (pair.name, n_synced, n_skipped)
+
+
 class FS25_OT_sync_debug_to_export_material(bpy.types.Operator):
-    """Sync the values of every fs25_param:* slider node in the active
-    debug material back to the customParameter_* IDProperties of its
-    paired export material. Required before re-export to persist any
-    changes made via the FS25 Material Settings panel - the re-export
-    reads from the export material, not from the debug node tree."""
+    """Sync fs25_param:* slider values from debug material(s) to the
+    customParameter_* IDProperties of their paired export material(s). Re-export
+    reads from the export material, so this persists changes made via the FS25
+    Material Settings / config preview. scope='selected' = the active object's
+    material; scope='all' = every debug material in the file."""
     bl_idname = "fs25.sync_debug_to_export_material"
     bl_label = "Sync to Export Material"
     bl_options = {'REGISTER', 'UNDO'}
 
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        if obj is None or obj.active_material is None:
-            return False
-        return obj.active_material.get('_i3d_material_kind') == 'debug'
+    scope: StringProperty(default='selected')
 
     def execute(self, context):
-        mat = context.active_object.active_material
-        mid = mat.get('_i3d_material_id')
-        imp_uuid = mat.get('_i3d_import_uuid')
-        if mid is None:
-            self.report({'WARNING'},
-                        "Active material is not an FS25 import")
-            return {'CANCELLED'}
-
-        # Find the paired export material via (material_id, uuid, kind).
-        pair = None
-        for m in bpy.data.materials:
-            if (m.get('_i3d_material_id') == mid
-                    and m.get('_i3d_import_uuid') == imp_uuid
-                    and m.get('_i3d_material_kind') == 'export'):
-                pair = m
-                break
-        if pair is None:
-            self.report({'WARNING'},
-                        f"No export counterpart for '{mat.name}'")
-            return {'CANCELLED'}
-
-        if not mat.use_nodes or mat.node_tree is None:
-            self.report({'WARNING'},
-                        "Active debug material has no node tree")
-            return {'CANCELLED'}
-
-        prefix = 'fs25_param:'
-
-        # Gather all fs25_param:* nodes, group them by fs25_xml_param
-        # (the XML <CustomParameter name>). Each group has one or more
-        # slots: 'all' for unsplit, or any combination of 'rgb' / 'w' /
-        # 'alpha' / 'x' / 'y' / 'z' for split parameters. The groups
-        # are then combined per group into one customParameter_<name>
-        # string and written to the paired export material.
-        groups = {}
-        for node in mat.node_tree.nodes:
-            if not node.name.startswith(prefix):
-                continue
-            slider_name = node.name[len(prefix):]
-            xml_param = node.get('fs25_xml_param')
-            if xml_param is None:
-                xml_param = slider_name  # backward-compat fallback
-            xml_slot = node.get('fs25_xml_slot') or 'all'
-            mode = node.get('fs25_serialize')
-            if mode is None:
-                # Backward-compat: infer from node type.
-                if node.type == 'RGB':
-                    mode = 'rgba'
-                elif node.type == 'VALUE':
-                    mode = 'float'
-                else:
+        if self.scope == 'all':
+            done = params = 0
+            for m in bpy.data.materials:
+                if m.get('_i3d_material_kind') != 'debug':
                     continue
-            groups.setdefault(xml_param, {})[xml_slot] = (node, mode)
-
-        n_synced = 0
-        n_skipped = 0
-        for xml_param, slots in groups.items():
-            try:
-                serialized = _serialize_param_group(slots)
-            except Exception as e:
-                self.report({'WARNING'},
-                            f"Failed to combine '{xml_param}': {e}")
-                n_skipped += 1
-                continue
-            if serialized is None:
-                n_skipped += 1
-                continue
-            pair[f'customParameter_{xml_param}'] = serialized
-            n_synced += 1
-
-        msg = f"Synced {n_synced} parameter(s) to '{pair.name}'"
-        if n_skipped:
-            msg += f" ({n_skipped} skipped)"
+                r = _sync_debug_material(m)
+                if r is not None:
+                    done += 1
+                    params += r[1]
+            self.report({'INFO'}, "Synced %d material(s), %d parameter(s) to "
+                        "export materials." % (done, params))
+            return {'FINISHED'}
+        obj = context.active_object
+        mat = obj.active_material if obj is not None else None
+        if mat is None or mat.get('_i3d_material_kind') != 'debug':
+            self.report({'WARNING'},
+                        "Active material is not an FS25 debug material.")
+            return {'CANCELLED'}
+        r = _sync_debug_material(mat)
+        if r is None:
+            self.report({'WARNING'}, "No export counterpart for '%s'" % mat.name)
+            return {'CANCELLED'}
+        name, n, sk = r
+        msg = "Synced %d parameter(s) to '%s'" % (n, name)
+        if sk:
+            msg += " (%d skipped)" % sk
         self.report({'INFO'}, msg)
         return {'FINISHED'}
+
+
+def _apply_config_xml(context, import_id, filepath, report):
+    """Assign a vehicle/placeable config XML's i3dMappings to *import_id*, register
+    it in the Giants exporter, and load its store-config preview. Shared by the
+    'Load Config XML' operator and the optional auto-load on i3d import.
+    Returns True on success, False when the XML has no <i3dMappings>.
+    """
+    _cfgmap = json.loads(context.scene.get('_i3d_configxml', '{}'))
+    _cfgmap[import_id] = bpy.path.abspath(filepath)
+    context.scene['_i3d_configxml'] = json.dumps(_cfgmap)
+    mappings = i3d_xml_parser.parse_i3d_mappings(filepath)
+    if not mappings:
+        report({'WARNING'}, "No <i3dMappings> found in this XML.")
+        return False
+    by_path = {}
+    for mid, npath in mappings:
+        by_path.setdefault(npath, mid)
+    path_index = {}
+    for obj in context.scene.objects:
+        if obj.get('_i3d_import_id') != import_id:
+            continue
+        pth = obj.get('_i3d_node_path')
+        if pth:
+            path_index.setdefault(pth, []).append(obj)
+    applied = 0
+    unmatched = []
+    for npath, mid in by_path.items():
+        objs = path_index.get(npath)
+        if not objs:
+            unmatched.append(mid)
+            continue
+        for obj in objs:
+            obj['I3D_XMLconfigID'] = mid
+            obj['I3D_XMLconfigBool'] = True
+            applied += 1
+    exporter_note = ""
+    settings = getattr(context.scene, "I3D_UIexportSettings", None)
+    if settings is not None:
+        attr = ("i3D_updateXMLFilePath" if hasattr(settings, "i3D_updateXMLFilePath")
+                else "I3D_updateXMLFilePath" if hasattr(settings, "I3D_updateXMLFilePath")
+                else None)
+        if attr is not None:
+            # Register a COPY in our own export folder with the exporter, not the
+            # original game XML: registering the game path directly (i) risks the
+            # Giants exporter overwriting a base-game file on re-export, and (ii)
+            # is the suspected cause of "exportObjectDataTexture: [Errno 22]
+            # Invalid argument" on re-export (game paths can be read-only/
+            # protected). Mirrors the existing i3D_exportFileLocation convention
+            # for the i3d output itself (see importer.py, EXPORT_DIR / i3d.name).
+            # Copy only if the destination is missing, so re-loading the same
+            # vehicle never clobbers an already-exported XML.
+            export_xml_path = filepath
+            _edir = _export_dir()
+            if _edir:
+                try:
+                    _dst = Path(bpy.path.abspath(_edir)) / Path(filepath).name
+                    if not _dst.exists():
+                        _dst.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(filepath, _dst)
+                    export_xml_path = str(_dst)
+                except OSError as exc:
+                    report({'WARNING'},
+                           "Could not copy config XML to export folder (%s) - "
+                           "registering the original game path instead, "
+                           "re-export may fail or touch the game file." % exc)
+            abspath = bpy.path.abspath(export_xml_path)
+            current = getattr(settings, attr)
+            if abspath not in current:
+                setattr(settings, attr, current + ";{};;".format(abspath))
+                exporter_note = "; added to Giants exporter XML Config Files"
+    # Store-config preview. wheelConfigurations start UNSELECTED (sel = -1): the
+    # default object-changes are still applied (index 0 below), but no wheel
+    # button is highlighted and the tires are not loaded until the user clicks.
+    try:
+        _cfg_types = i3d_config_parser.parse_configurations(filepath)
+        _rim_colors = i3d_wheel_resolver.parse_rim_colors(filepath)
+        _brands = i3d_wheel_resolver.parse_brands(
+            filepath, i3d_material_templates._data_dir(_fs25_data_base() or ""))
+        _sets = i3d_config_parser.parse_configuration_sets(filepath)
+        _wheelopts = i3d_wheel_resolver.parse_wheel_options(filepath)
+        if _cfg_types or _rim_colors or _brands or _sets or _wheelopts:
+            _store = json.loads(context.scene.get('_i3d_storecfg', '{}'))
+            _types_d = i3d_config_parser.to_dict(_cfg_types) if _cfg_types else []
+            _db = _fs25_data_base()
+            # Wheel selector, resolver-driven (multi-size configs expand into one
+            # option per size). Tires load on click (sel=-1), not at import.
+            _wheelopts_entry = ({"options": [
+                {"label": _l, "config_index": _ci, "dim_col": _dc}
+                for _ci, _dc, _l in _wheelopts], "sel": -1}
+                if _wheelopts else None)
+            # Initial selection = the game's default option per type
+            # (getDefaultConfigIdFromItems: isDefault/first selectable, not stured 0).
+            # wheelConfigurations stays -1 (tires load on click, not at import).
+            _entry = {
+                "types": _types_d,
+                "sel": {t["tag"]: (-1 if t["tag"] == "wheelConfigurations"
+                                   else t.get("default", 0))
+                        for t in _types_d}}
+            # Configuration sets (presets): pin the default set's sub-config
+            # indices. The set chooser replaces those sub-configs in the UI.
+            if _sets:
+                _dset = next((i for i, s in enumerate(_sets["sets"])
+                              if s.get("is_default")), 0)
+                _entry["sets"] = {"title": _sets["title"],
+                                  "controlled": _sets["controlled"],
+                                  "options": _sets["sets"], "sel": _dset}
+                for _cn, _ix in _sets["sets"][_dset]["configs"].items():
+                    _tag = _cn + "Configurations"
+                    if _tag in _entry["sel"] and _tag != "wheelConfigurations":
+                        _entry["sel"][_tag] = _ix
+            if _wheelopts_entry:
+                _entry["wheelopts"] = _wheelopts_entry
+            if _rim_colors:
+                # Rim colour applies to wheels/weights once they are loaded
+                # (default index 0 = the stock colour); applied after a wheel
+                # config is loaded, not here.
+                _entry["rimcolor"] = {
+                    "options": [{"label": i3d_config_preview.rim_color_label(_t, _db),
+                                 "template": _t, "selectable": _s}
+                                for _i, _t, _s in _rim_colors],
+                    "sel": 0}
+            if _brands and len(_brands) > 1:
+                _entry["brand"] = {
+                    "options": [{"label": (_b.title() + " " + (_n or "")).strip(),
+                                 "index": _bi, "brand": _b}
+                                for _bi, _b, _n in _brands],
+                    "sel": 0}
+            _store[import_id] = _entry
+            context.scene['_i3d_storecfg'] = json.dumps(_store)
+            if _types_d:
+                i3d_config_preview.capture_material_originals(import_id, _types_d)
+                for _t in _types_d:
+                    # Apply the finalized selection (incl. default-set overrides);
+                    # wheelConfigurations shows its default object-changes but its
+                    # button stays unselected (sel=-1) until the user loads tires.
+                    _ix = (_t.get("default", 0)
+                           if _t["tag"] == "wheelConfigurations"
+                           else _entry["sel"].get(_t["tag"], _t.get("default", 0)))
+                    i3d_config_preview.apply_config(import_id, _t, _ix, _db)
+    except Exception as _e:
+        report({'INFO'}, "Store-config preview not loaded: %r" % _e)
+    if unmatched:
+        report({'WARNING'},
+               "%d i3dMapping(s) not assigned (no matching object - e.g. a "
+               "skinned bone/joint): %s" % (len(unmatched), ", ".join(unmatched)))
+    msg = "Applied %d i3dMapping(s) to import '%s' from %d entries" % (
+        applied, import_id, len(by_path))
+    if unmatched:
+        msg += "; %d not assigned (see warning)" % len(unmatched)
+    report({'INFO'}, msg + exporter_note + ".")
+    return True
 
 
 class FS25_OT_load_config_xml(Operator, ImportHelper):
@@ -681,80 +880,9 @@ class FS25_OT_load_config_xml(Operator, ImportHelper):
 
     def execute(self, context):
         import_id = context.active_object.get('_i3d_import_id')
-        mappings = i3d_xml_parser.parse_i3d_mappings(self.filepath)
-        if not mappings:
-            self.report({'WARNING'}, "No <i3dMappings> found in this XML.")
-            return {'CANCELLED'}
-        by_path = {}
-        for mid, npath in mappings:
-            by_path.setdefault(npath, mid)
-        path_index = {}
-        for obj in context.scene.objects:
-            if obj.get('_i3d_import_id') != import_id:
-                continue
-            p = obj.get('_i3d_node_path')
-            if p:
-                path_index.setdefault(p, []).append(obj)
-        applied = 0
-        unmatched = []
-        for npath, mid in by_path.items():
-            objs = path_index.get(npath)
-            if not objs:
-                unmatched.append(mid)
-                continue
-            for obj in objs:
-                obj['I3D_XMLconfigID'] = mid
-                obj['I3D_XMLconfigBool'] = True
-                applied += 1
-        # Convenience: also register this XML in the Giants exporter's "XML Config
-        # Files" list (scene I3D_UIexportSettings.i3D_updateXMLFilePath, joined as
-        # ';path;;'), so the user does not have to pick the file a second time for
-        # "Update XML". No-op when the exporter is not installed. Casing differs:
-        # FS25 10.0.x uses i3D_*, FS22 9.x uses I3D_*.
-        exporter_note = ""
-        settings = getattr(context.scene, "I3D_UIexportSettings", None)
-        if settings is not None:
-            attr = ("i3D_updateXMLFilePath" if hasattr(settings, "i3D_updateXMLFilePath")
-                    else "I3D_updateXMLFilePath" if hasattr(settings, "I3D_updateXMLFilePath")
-                    else None)
-            if attr is not None:
-                abspath = bpy.path.abspath(self.filepath)
-                current = getattr(settings, attr)
-                if abspath not in current:
-                    setattr(settings, attr, current + ";{};;".format(abspath))
-                    exporter_note = "; added to Giants exporter XML Config Files"
-
-        # Parse store configurations (designs, work areas, ...) for the in-Blender
-        # preview and stash them on the scene, keyed by import id. Applying the
-        # default option (index 0) reproduces the default store look.
-        try:
-            _cfg_types = i3d_config_parser.parse_configurations(self.filepath)
-            if _cfg_types:
-                _store = json.loads(context.scene.get('_i3d_storecfg', '{}'))
-                _types_d = i3d_config_parser.to_dict(_cfg_types)
-                _store[import_id] = {"types": _types_d,
-                                     "sel": {t["tag"]: 0 for t in _types_d}}
-                context.scene['_i3d_storecfg'] = json.dumps(_store)
-                _db = _fs25_data_base()
-                i3d_config_preview.capture_material_originals(import_id, _types_d)
-                for _t in _types_d:
-                    i3d_config_preview.apply_config(import_id, _t, 0, _db)
-        except Exception as _e:
-            self.report({'INFO'}, "Store-config preview not loaded: %r" % _e)
-
-        if unmatched:
-            # Nothing is silently lost: list the ids that found no matching object.
-            # Most commonly these target a skinned bone/joint, which is not assigned
-            # (bones are a rare i3dMapping target - see notes).
-            self.report(
-                {'WARNING'},
-                "%d i3dMapping(s) not assigned (no matching object - e.g. a "
-                "skinned bone/joint): %s" % (len(unmatched), ", ".join(unmatched)))
-        msg = f"Applied {applied} i3dMapping(s) to import '{import_id}' from {len(by_path)} entries"
-        if unmatched:
-            msg += f"; {len(unmatched)} not assigned (see warning)"
-        self.report({'INFO'}, msg + exporter_note + ".")
-        return {'FINISHED'}
+        if _apply_config_xml(context, import_id, self.filepath, self.report):
+            return {'FINISHED'}
+        return {'CANCELLED'}
 
 
 class FS25_PT_i3d_importer_panel(bpy.types.Panel):
@@ -767,6 +895,13 @@ class FS25_PT_i3d_importer_panel(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
+
+        # One-click pre-export prep (snow + GE-invisible + config reset +
+        # export materials, in order). Prominent at the top.
+        pbox = layout.box()
+        pbox.label(text="Before Export", icon='EXPORT')
+        pbox.operator("fs25.prepare_for_export", text="Prepare for Export",
+                      icon='CHECKMARK')
 
         # Material switch section
         box = layout.box()
@@ -811,6 +946,7 @@ class FS25_PT_i3d_importer_panel(bpy.types.Panel):
         # which the exporter's own RNA UI field fails to write in Blender 5.1+.
         if active is not None and active.get('I3D_XMLconfigID') is not None:
             mbox.prop(active, "i3d_importer_mapping_id", text="Mapping ID")
+
 
         # Tree season - shown only when the file actually has a
         # tree-branch debug material (treeBranchShader SEASONAL).
@@ -894,8 +1030,18 @@ class FS25_PT_material_settings(bpy.types.Panel):
         # Sync slider values back to the paired export material's
         # customParameter_* IDProperties so re-export sees them.
         layout.separator()
-        layout.operator("fs25.sync_debug_to_export_material",
-                        icon='FILE_REFRESH')
+        layout.label(text="Sync to Export Material")
+        row = layout.row(align=True)
+        sub = row.row(align=True)
+        _am = context.active_object.active_material if context.active_object else None
+        sub.enabled = (_am is not None
+                       and _am.get('_i3d_material_kind') == 'debug')
+        op = sub.operator("fs25.sync_debug_to_export_material", text="Selected",
+                          icon='FILE_REFRESH')
+        op.scope = 'selected'
+        op_all = row.operator("fs25.sync_debug_to_export_material", text="All",
+                              icon='FILE_REFRESH')
+        op_all.scope = 'all'
 
 
 # ---------------------------------------------------------------------------
@@ -1110,6 +1256,244 @@ class FS25_OT_invisible_ge_hide(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def _reset_config_preview():
+    """Re-show every part hidden by the store-config preview: clear the preview
+    hide flags and the _i3d_cfg_hidden/_i3d_cfg_inh tags. Returns the number of
+    parts shown."""
+    n = 0
+    for obj in bpy.data.objects:
+        if obj.get('_i3d_cfg_hidden') or obj.get('_i3d_cfg_inh'):
+            obj.hide_viewport = False
+            obj.hide_render = False
+            for k in ('_i3d_cfg_hidden', '_i3d_cfg_inh'):
+                if k in obj:
+                    del obj[k]
+            n += 1
+    return n
+
+
+def _restore_prebake_wheel_meshes():
+    """Swap every baked wheel part (rims + twin connectors,
+    i3d_wheel_loader._bake_*_mesh) back to its PRISTINE pre-bake mesh
+    datablock: the export must write the UN-deformed geometry - GE/game
+    re-run the shader at runtime, a baked mesh would deform twice.
+
+    MUST run BEFORE the export material switch: materials live on the mesh
+    datablock, so switching first and restoring afterwards left the rims on
+    their debug materials and wrote the widthAndDiam parameter onto the
+    debug (not export) materials - rims came out standard-sized in GE
+    (Vario1000, #14 follow-up). Returns the number of meshes restored."""
+    n = 0
+    for o in bpy.data.objects:
+        if o.get("_i3d_wheel_import") is None or o.type != 'MESH' or not o.data:
+            continue
+        pre = o.data.get("_i3d_prebake_mesh")
+        if pre:
+            nd = bpy.data.meshes.get(pre)
+            if nd is not None and nd is not o.data:
+                o.data = nd
+                n += 1
+    return n
+
+
+def _prepare_rims_for_export():
+    """Make re-exported rims deform correctly in the Giants Editor / game. The FS
+    rim shader (vehicleShader 'rim', getRimPos) dishes the rim procedurally from a
+    widthAndDiam parameter applied to the NORMALISED mesh; our preview instead uses
+    an object scale, so a re-export would double-transform (scale + shader) and the
+    shader would run with the default 40x40. This sets each rim's real width/diam
+    as a material customParameter (splitting the mesh data + material when several
+    sizes share one physical rim mesh) and resets the preview scale to 1, so the
+    shader alone sizes and dishes the rim. Returns the number of rim parts prepared.
+
+    Note: this is an export step - it un-scales the rims in the viewport (Blender
+    cannot run getRimPos), so the preview rims look normalised afterwards.
+
+    Splitting must duplicate the MESH DATA, not just re-link a material on the
+    object: the Giants exporter reads materials straight off
+    ``bpy.data.meshes[...].materials`` (dccBlender.getShapeMaterials), not via
+    ``object.material_slots`` - so a per-object material-slot override (link=
+    'OBJECT') is invisible to it and was silently dropped on export."""
+    from collections import defaultdict
+    rims = [o for o in bpy.data.objects
+            if o.get("_i3d_wheel_role") in ("rim_outer", "rim_inner")
+            and o.get("_i3d_rim_wd") and o.type == 'MESH']
+    if not rims:
+        return 0
+    by_data = defaultdict(list)
+    for o in rims:
+        by_data[o.data.name].append(o)
+    data_copies = {}   # (data_name, wd) -> duplicated mesh datablock
+    for data_name, objs in by_data.items():
+        sizes = sorted({o.get("_i3d_rim_wd") for o in objs})
+        first_wd = sizes[0]          # this size keeps the original mesh/material
+        for o in objs:
+            wd = o.get("_i3d_rim_wd")
+            param = "%s 1" % wd                      # "7 44" -> "7 44 1"
+            if wd != first_wd:
+                dk = (data_name, wd)
+                nd = data_copies.get(dk)
+                if nd is None:
+                    nd = o.data.copy()
+                    # give this mesh copy its own material datablocks too, so
+                    # the widthAndDiam we set below doesn't leak back onto the
+                    # original (still shared) material.
+                    for i, m in enumerate(nd.materials):
+                        if m is not None:
+                            nd.materials[i] = m.copy()
+                    data_copies[dk] = nd
+                o.data = nd
+            for m in o.data.materials:
+                if m is not None:
+                    m["customParameter_widthAndDiam"] = param
+            # Rims with a raw XML scale keep it: the game applies scale AND
+            # the widthAndDiam shader sequentially (WheelVisualPart:setNode),
+            # so the exported node needs the scale on top of the parameter.
+            if not o.get("_i3d_rim_keep_scale"):
+                o.scale = (1.0, 1.0, 1.0)
+
+    # Twin connectors: same principle as the rims. The export writes the
+    # PRISTINE mesh, and GE runs the rimDual/hubDual shader with the MATERIAL
+    # parameters - the file defaults (connectorPos "0 80 40 40") blow the
+    # cage up to a ~2 m drum (Vestrum re-export). Write the runtime values
+    # (stored by the loader at bake time) as customParameter_* into the
+    # export materials, splitting mesh data + materials when connectors with
+    # different parameters share one datablock (front vs rear twins).
+    conns = [o for o in bpy.data.objects
+             if o.get("_i3d_wheel_role") == "connector"
+             and o.get("_i3d_conn_shader") and o.type == 'MESH']
+    by_data_c = defaultdict(list)
+    for o in conns:
+        by_data_c[o.data.name].append(o)
+    for data_name, objs in by_data_c.items():
+        def _pkey(o):
+            return (o.get("_i3d_conn_connectorPos") or "",
+                    o.get("_i3d_conn_widthAndDiam") or "",
+                    o.get("_i3d_conn_posAndScale") or "")
+        psets = sorted({_pkey(o) for o in objs})
+        first = psets[0]
+        copies = {}
+        for o in objs:
+            pk = _pkey(o)
+            if pk != first:
+                nd = copies.get(pk)
+                if nd is None:
+                    nd = o.data.copy()
+                    for i, m in enumerate(nd.materials):
+                        if m is not None:
+                            nd.materials[i] = m.copy()
+                    copies[pk] = nd
+                o.data = nd
+            for m in o.data.materials:
+                if m is None:
+                    continue
+                if o.get("_i3d_conn_connectorPos"):
+                    m["customParameter_connectorPos"] = \
+                        o["_i3d_conn_connectorPos"]
+                if o.get("_i3d_conn_widthAndDiam"):
+                    m["customParameter_widthAndDiam"] = \
+                        o["_i3d_conn_widthAndDiam"]
+                if o.get("_i3d_conn_posAndScale"):
+                    m["customParameter_connectorPosAndScale"] = \
+                        o["_i3d_conn_posAndScale"]
+    return len(rims) + len(conns)
+
+
+class FS25_OT_config_show_all(bpy.types.Operator):
+    """Re-show every part hidden by the store-config preview (undo all config
+    hiding). Mirrors the Show-All buttons of the Snow and GE-invisible panels."""
+    bl_idname = "fs25.config_show_all"
+    bl_label = "Show All Config Parts"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        n = _reset_config_preview()
+        self.report({'INFO'}, "Shown %d config-hidden part(s)" % n)
+        return {'FINISHED'}
+
+
+class FS25_OT_config_reset_default(bpy.types.Operator):
+    """Reset the store-config preview to the vehicle's default configuration: set
+    every config type back to its default option and re-apply it, so the non-
+    default parts (incl. isSelectable="false" ones) are hidden again. Counterpart
+    to 'Show All Config Parts', which cannot be undone by picking options."""
+    bl_idname = "fs25.config_reset_default"
+    bl_label = "Default Config"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        obj = context.active_object
+        import_id = obj.get('_i3d_import_id') if obj else None
+        if import_id is None:
+            self.report({'WARNING'}, "Select an imported object first.")
+            return {'CANCELLED'}
+        store = json.loads(context.scene.get('_i3d_storecfg', '{}'))
+        entry = store.get(import_id)
+        if not entry:
+            self.report({'WARNING'}, "No store config loaded for this import.")
+            return {'CANCELLED'}
+        db = _fs25_data_base()
+        sel = entry.setdefault("sel", {})
+        # Re-apply every visual config type at its default option. Wheels keep
+        # their state (tires are separately loaded geometry, not config-hidden).
+        for ct in entry.get("types", []):
+            if ct["tag"] == "wheelConfigurations":
+                continue
+            di = ct.get("default", 0)
+            sel[ct["tag"]] = di
+            i3d_config_preview.apply_config(import_id, ct, di, db)
+        context.scene['_i3d_storecfg'] = json.dumps(store)
+        self.report({'INFO'}, "Reset to default configuration")
+        return {'FINISHED'}
+
+
+class FS25_OT_prepare_for_export(bpy.types.Operator):
+    """One click to get the scene ready for the Giants i3d exporter, in order:
+    (1) show all snow/ice, (2) show all GE-invisible objects, (3) reset the store-
+    config preview (re-show every config-hidden part), (4) switch every imported
+    mesh to its re-export material. The Giants exporter writes each node's current
+    viewport visibility and has no auto-unhide, so anything left hidden would be
+    dropped or exported as visibility=false - this makes the re-export complete."""
+    bl_idname = "fs25.prepare_for_export"
+    bl_label = "Prepare for Export"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        n_snow = n_ge = n_cfg = 0
+        # 1. snow/ice, 2. GE-invisible: clear the Outliner eye (hide_set) as the
+        # dedicated buttons do.
+        for obj in context.scene.objects:
+            if obj.get('_i3d_is_snow_heap'):
+                obj.hide_set(False)
+                n_snow += 1
+            if obj.get('_i3d_invisible_in_ge'):
+                obj.hide_set(False)
+                n_ge += 1
+        # 3. reset the config preview: re-show every part hidden by a store config.
+        n_cfg = _reset_config_preview()
+        # 4. swap baked wheel meshes back to their pristine datablocks BEFORE
+        # the material switch - materials live on the mesh datablock, so the
+        # switch and the widthAndDiam parameters below must hit the mesh that
+        # is actually exported (see _restore_prebake_wheel_meshes).
+        n_pre = _restore_prebake_wheel_meshes()
+        # 5. switch every imported mesh to its re-export material (scene-wide, so
+        # hidden helper meshes cannot leak a debug material into the export).
+        try:
+            bpy.ops.fs25.switch_materials(target_kind='export',
+                                          scope='all_imported')
+            mat_msg = "export materials applied"
+        except Exception as exc:
+            mat_msg = "material switch skipped (%r)" % exc
+        # 6. rims: write the real widthAndDiam onto the (now active) export material
+        # and un-scale, so the Giants rim shader dishes them correctly on re-export.
+        n_rim = _prepare_rims_for_export()
+        self.report({'INFO'},
+                    "Prepared for export: snow %d, GE-invisible %d, config-reset "
+                    "%d, wheel meshes %d, rims %d; %s"
+                    % (n_snow, n_ge, n_cfg, n_pre, n_rim, mat_msg))
+        return {'FINISHED'}
+
+
 class FS25_PT_invisible_ge_objects(bpy.types.Panel):
     """Sub-panel: show/hide all objects marked invisible in the
     Giants Editor (visibility=false or nonRenderable=true without
@@ -1208,6 +1592,13 @@ def _fs25_data_base():
         return ""
 
 
+def _export_dir():
+    try:
+        return bpy.context.preferences.addons[__package__].preferences.export_dir
+    except Exception:
+        return ""
+
+
 def _pretty_cfg_label(s):
     """Make an l10n key or raw config label readable for the UI.
 
@@ -1220,7 +1611,100 @@ def _pretty_cfg_label(s):
     if s.startswith("$l10n_"):
         s = s.split("value", 1)[1] if "value" in s else s.rsplit("_", 1)[-1]
     s = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", s).strip()
+    s = (s[:1].upper() + s[1:]) if s else s
     return s or "Option"
+
+
+def _option_label(opt):
+    """Button label for one config option: prettified name plus the option's
+    ``params`` value(s). Giants uses ONE l10n key with %s placeholders for a
+    whole option group (farmall120C: four $l10n_configuration_frontWeightX
+    entries, params 60/220/300/380) - the translated text lives in dataS.gar
+    and is not resolvable here, so without the params every button read
+    identically (#12). The placeholder shows up as a trailing 'X' in the
+    prettified key name and is replaced by the params; a literal %s (mod
+    XMLs with plain-text names) is substituted directly."""
+    raw = opt.get("label") or ""
+    params = (opt.get("params") or "").strip()
+    if params and "%s" in raw:
+        # Plain-text name with %s placeholders (timberFrameFH16 Extension:
+        # name="1 x 5%s" params="$l10n_unit_mShort" - the game resolves the
+        # l10n PARAMS before substituting). We cannot translate, so strip the
+        # token down to its unit like the configurationSet labels do
+        # (i3d_config_parser._set_label): "$l10n_unit_mShort" -> "m".
+        label = raw
+        for p in params.split("|"):
+            # clean each param BEFORE substituting: "1 x 5%s" glues the unit
+            # to a digit ("5mShort"), where a \b-based cleanup cannot bite.
+            p = re.sub(r"^\$l10n_(?:unit_)?", "", p)
+            p = re.sub(r"^([a-zA-Z]{1,6})Short$", r"\1", p)
+            label = label.replace("%s", p, 1)
+        label = re.sub(r"\$l10n_(?:unit_|configuration_value|configuration_)?",
+                       "", label)
+        label = re.sub(r"\b([a-zA-Z]{1,6})Short\b", r"\1", label)
+        return label.strip() or "Option"
+    label = _pretty_cfg_label(raw)
+    if not params:
+        return label
+    if label.endswith(" X"):
+        label = label[:-2]
+    return ("%s %s" % (label, " ".join(params.split("|")))).strip()
+
+
+def _update_brand_options(context, import_id, entry, config_index, dim_col=0):
+    """Recompute the tire-brand options for the selected wheel configuration + size
+    and reset the brand selection. Each config offers only the manufacturers that
+    supply all of its wheel sizes, so the list (and default) differs per config -
+    e.g. the Puma default has 6 brands, its narrow-row configs far fewer."""
+    cfgmap = json.loads(context.scene.get('_i3d_configxml', '{}'))
+    xml = cfgmap.get(import_id)
+    data_dir = i3d_material_templates._data_dir(_fs25_data_base() or "")
+    if not (xml and data_dir and os.path.isfile(xml)):
+        return
+    # Remember the currently-selected brand so a compatible choice survives a
+    # config/size switch; only fall back to the default when that brand is not
+    # offered by the new configuration.
+    prev = entry.get("brand")
+    prev_brand = None
+    if prev and prev.get("options"):
+        psel = prev.get("sel", 0)
+        if 0 <= psel < len(prev["options"]):
+            prev_brand = (prev["options"][psel].get("brand") or "").lower()
+    brands = i3d_wheel_resolver.parse_brands(xml, data_dir, config_index, dim_col)
+    if brands and len(brands) > 1:
+        options = [{"label": (b.title() + " " + (n or "")).strip(),
+                    "index": bi, "brand": b} for bi, b, n in brands]
+        sel = 0
+        if prev_brand:
+            sel = next((o["index"] for o in options
+                        if (o["brand"] or "").lower() == prev_brand), 0)
+        entry["brand"] = {"options": options, "sel": sel}
+    else:
+        entry.pop("brand", None)
+
+
+def _reload_wheels(context, import_id, entry, config_index, dim_col=0):
+    """Load the wheels for *config_index* + size column *dim_col* using the entry's
+    selected tire brand, then re-apply the selected rim colour. Returns False if the
+    config XML / FS25 data base are unavailable. Shared by the wheel/brand ops."""
+    cfgmap = json.loads(context.scene.get('_i3d_configxml', '{}'))
+    xml = cfgmap.get(import_id)
+    data_dir = i3d_material_templates._data_dir(_fs25_data_base() or "")
+    if not (xml and os.path.isfile(xml) and data_dir and os.path.isdir(data_dir)):
+        return False
+    brand = entry.get("brand", {}).get("sel", 0)
+    i3d_wheel_loader.load_all_wheels(xml, data_dir, import_id, config_index,
+                                     brand_index=brand, dim_col=dim_col)
+    rc = entry.get("rimcolor")
+    if rc and rc.get("options"):
+        sel = rc.get("sel", 0)
+        if 0 <= sel < len(rc["options"]):
+            # Bake into the export material only for the stock colour (index 0);
+            # user picks stay preview-only and go to export via the Sync button.
+            i3d_config_preview.apply_rim_color(
+                import_id, rc["options"][sel]["template"], _fs25_data_base(),
+                to_export=(sel == 0))
+    return True
 
 
 class FS25_OT_apply_store_config(Operator):
@@ -1247,9 +1731,251 @@ class FS25_OT_apply_store_config(Operator):
         if ct is None:
             return {'CANCELLED'}
         entry["sel"][self.config_tag] = self.option_index
+        # A new wheel configuration changes which tire brands are available, so
+        # rebuild the brand list (and reset it to that config's default brand)
+        # before loading the tires below.
+        if self.config_tag == "wheelConfigurations":
+            _update_brand_options(context, import_id, entry, self.option_index)
         context.scene['_i3d_storecfg'] = json.dumps(store)
         i3d_config_preview.apply_config(import_id, ct, self.option_index,
                                        _fs25_data_base())
+        # A wheel configuration also swaps the actual tires/rims (external i3ds).
+        # Load + place them for the chosen option (replaces previously loaded
+        # wheels). Only happens on click, not on the default apply at XML load.
+        if self.config_tag == "wheelConfigurations":
+            try:
+                ok = _reload_wheels(context, import_id, entry, self.option_index)
+            except Exception as exc:
+                self.report({'WARNING'}, "Tires not loaded: %r" % exc)
+            else:
+                if not ok:
+                    self.report({'INFO'}, "Object changes applied; load the "
+                                "vehicle Config XML and set the FS25 data base "
+                                "to also load the tires.")
+        return {'FINISHED'}
+
+
+class FS25_OT_apply_rim_color(Operator):
+    """Apply a rim colour (and its gloss) to this import's wheels + weights."""
+    bl_idname = "fs25.apply_rim_color"
+    bl_label = "Apply rim colour"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    option_index: IntProperty()
+
+    def execute(self, context):
+        obj = context.active_object
+        import_id = obj.get('_i3d_import_id') if obj else None
+        if import_id is None:
+            self.report({'WARNING'}, "Select an imported object first.")
+            return {'CANCELLED'}
+        store = json.loads(context.scene.get('_i3d_storecfg', '{}'))
+        entry = store.get(import_id)
+        rc = entry.get("rimcolor") if entry else None
+        if not rc or not (0 <= self.option_index < len(rc.get("options", []))):
+            return {'CANCELLED'}
+        rc["sel"] = self.option_index
+        context.scene['_i3d_storecfg'] = json.dumps(store)
+        i3d_config_preview.apply_rim_color(
+            import_id, rc["options"][self.option_index]["template"],
+            _fs25_data_base())
+        return {'FINISHED'}
+
+
+class FS25_OT_apply_tire_brand(Operator):
+    """Switch the tire brand and reload the wheels (keeps the current size
+    configuration and rim colour)."""
+    bl_idname = "fs25.apply_tire_brand"
+    bl_label = "Apply tire brand"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    option_index: IntProperty()
+
+    def execute(self, context):
+        obj = context.active_object
+        import_id = obj.get('_i3d_import_id') if obj else None
+        if import_id is None:
+            self.report({'WARNING'}, "Select an imported object first.")
+            return {'CANCELLED'}
+        store = json.loads(context.scene.get('_i3d_storecfg', '{}'))
+        entry = store.get(import_id)
+        brand = entry.get("brand") if entry else None
+        if not brand or not (0 <= self.option_index < len(brand.get("options", []))):
+            return {'CANCELLED'}
+        brand["sel"] = self.option_index
+        context.scene['_i3d_storecfg'] = json.dumps(store)
+        wo = entry.get("wheelopts")
+        if wo and wo.get("sel", -1) >= 0:
+            opt = wo["options"][wo["sel"]]
+            try:
+                _reload_wheels(context, import_id, entry,
+                               opt["config_index"], opt["dim_col"])
+            except Exception as exc:
+                self.report({'WARNING'}, "Tires not reloaded: %r" % exc)
+        else:
+            self.report({'INFO'}, "Brand set - click a wheel option to load tires.")
+        return {'FINISHED'}
+
+
+class FS25_OT_load_wheel_option(Operator):
+    """Load a wheel option: one wheel configuration, expanded per size. Applies the
+    config's object changes (fenders etc.), rebuilds the brand list for that size,
+    and loads the tires/rims/hubs. Replaces the old wheel entry in the type menu so
+    that size-only vehicles (skid-steers, sprayers) get a wheel menu too."""
+    bl_idname = "fs25.load_wheel_option"
+    bl_label = "Load wheel option"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    option_index: IntProperty()
+
+    def execute(self, context):
+        obj = context.active_object
+        import_id = obj.get('_i3d_import_id') if obj else None
+        if import_id is None:
+            self.report({'WARNING'}, "Select an imported object first.")
+            return {'CANCELLED'}
+        store = json.loads(context.scene.get('_i3d_storecfg', '{}'))
+        entry = store.get(import_id)
+        wo = entry.get("wheelopts") if entry else None
+        if not wo or not (0 <= self.option_index < len(wo.get("options", []))):
+            return {'CANCELLED'}
+        opt = wo["options"][self.option_index]
+        cfg_i, col = opt["config_index"], opt["dim_col"]
+        wo["sel"] = self.option_index
+        entry.setdefault("sel", {})["wheelConfigurations"] = cfg_i
+        db = _fs25_data_base()
+        # Object changes of the wheel config (e.g. fenders), if the config has any.
+        ct = next((t for t in entry.get("types", [])
+                   if t["tag"] == "wheelConfigurations"), None)
+        if ct is not None:
+            i3d_config_preview.apply_config(import_id, ct, cfg_i, db)
+        # Brands depend on the selected config + size.
+        _update_brand_options(context, import_id, entry, cfg_i, col)
+        context.scene['_i3d_storecfg'] = json.dumps(store)
+        try:
+            ok = _reload_wheels(context, import_id, entry, cfg_i, col)
+        except Exception as exc:
+            self.report({'WARNING'}, "Tires not loaded: %r" % exc)
+            return {'FINISHED'}
+        if not ok:
+            self.report({'INFO'}, "Load the vehicle Config XML and set the FS25 "
+                        "data base to load the tires.")
+        return {'FINISHED'}
+
+
+class FS25_OT_unload_wheels(Operator):
+    """Remove all loaded wheel parts of this import (tires, rims, weights,
+    twin connectors, hubs) - back to the bare vehicle, the state right after
+    import. The game loads wheels dynamically at runtime, so a re-export is
+    cleanest WITHOUT them: no duplicate static wheels in the i3d and no
+    shifted i3dMapping index paths"""
+    bl_idname = "fs25.unload_wheels"
+    bl_label = "Unload wheels"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        obj = context.active_object
+        import_id = obj.get('_i3d_import_id') if obj else None
+        if import_id is None:
+            self.report({'WARNING'}, "Select an imported object first.")
+            return {'CANCELLED'}
+        store = json.loads(context.scene.get('_i3d_storecfg', '{}'))
+        entry = store.get(import_id)
+        if entry:
+            wo = entry.get("wheelopts")
+            if wo:
+                wo["sel"] = -1
+            # The brand list belongs to a loaded wheel config.
+            entry.pop("brand", None)
+            context.scene['_i3d_storecfg'] = json.dumps(store)
+        n = i3d_wheel_loader.remove_wheels(import_id)
+        i3d_wheel_loader._purge_empty_ref_collections()
+        # Leave no residue: baked wheel meshes are now user-less, and their
+        # pristine pre-bake datablocks are pinned only by our fake user
+        # (marked _i3d_prebake_kept at bake time) - purge both.
+        n_mesh = 0
+        for me in list(bpy.data.meshes):
+            try:
+                if me.users == 0:
+                    bpy.data.meshes.remove(me)
+                    n_mesh += 1
+            except Exception:
+                pass
+        for me in list(bpy.data.meshes):
+            try:
+                if (me.get("_i3d_prebake_kept") and me.use_fake_user
+                        and me.users == 1):
+                    bpy.data.meshes.remove(me)
+                    n_mesh += 1
+            except Exception:
+                pass
+        self.report({'INFO'}, "Removed %d wheel part(s), purged %d mesh(es)."
+                    % (n, n_mesh))
+        return {'FINISHED'}
+
+
+class FS25_OT_apply_config_set(Operator):
+    """Apply a configuration set (preset): pin every controlled config type to the
+    set's index and re-apply it. Replaces picking those sub-configs individually
+    (e.g. one working-width preset sets folding/animation/width at once)."""
+    bl_idname = "fs25.apply_config_set"
+    bl_label = "Apply configuration set"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    set_index: IntProperty()
+
+    def execute(self, context):
+        obj = context.active_object
+        import_id = obj.get('_i3d_import_id') if obj else None
+        if import_id is None:
+            self.report({'WARNING'}, "Select an imported object first.")
+            return {'CANCELLED'}
+        store = json.loads(context.scene.get('_i3d_storecfg', '{}'))
+        entry = store.get(import_id)
+        sets = entry.get("sets") if entry else None
+        if not sets or not (0 <= self.set_index < len(sets.get("options", []))):
+            return {'CANCELLED'}
+        sets["sel"] = self.set_index
+        db = _fs25_data_base()
+        by_tag = {t["tag"]: t for t in entry.get("types", [])}
+        sel = entry.setdefault("sel", {})
+        for cname, idx0 in sets["options"][self.set_index]["configs"].items():
+            tag = cname + "Configurations"
+            ct = by_tag.get(tag)
+            if ct is not None:
+                sel[tag] = idx0
+                i3d_config_preview.apply_config(import_id, ct, idx0, db)
+            if tag == "wheelConfigurations":
+                # a preset can pin the wheel config - load its tires too
+                sel[tag] = idx0
+                try:
+                    _reload_wheels(context, import_id, entry, idx0)
+                except Exception as exc:
+                    self.report({'WARNING'}, "Tires not loaded: %r" % exc)
+        context.scene['_i3d_storecfg'] = json.dumps(store)
+        self.report({'INFO'},
+                    "Applied set: %s" % sets["options"][self.set_index]["label"])
+        return {'FINISHED'}
+
+
+class FS25_OT_toggle_cfg_section(Operator):
+    """Collapse / expand a Store-Config section."""
+    bl_idname = "fs25.toggle_cfg_section"
+    bl_label = "Toggle section"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    section: StringProperty()
+
+    def execute(self, context):
+        obj = context.active_object
+        import_id = obj.get('_i3d_import_id') if obj else None
+        store = json.loads(context.scene.get('_i3d_storecfg', '{}'))
+        entry = store.get(import_id) if import_id else None
+        if entry is None:
+            return {'CANCELLED'}
+        ex = entry.setdefault("expand", {})
+        ex[self.section] = not ex.get(self.section, True)
+        context.scene['_i3d_storecfg'] = json.dumps(store)
         return {'FINISHED'}
 
 
@@ -1271,21 +1997,150 @@ class FS25_PT_store_config(bpy.types.Panel):
             return
         store = json.loads(context.scene.get('_i3d_storecfg', '{}'))
         entry = store.get(import_id)
-        if not entry or not entry.get("types"):
+        if not entry or not (entry.get("types") or entry.get("rimcolor")
+                             or entry.get("wheelopts") or entry.get("sets")):
             layout.label(text="No store configurations loaded", icon='INFO')
             layout.label(text="Use i3dMappings > Load Config XML")
             return
-        for t in entry["types"]:
+        expand = entry.get("expand", {})
+
+        # Show every config-hidden part again (mirrors the Snow / GE-invisible
+        # Show-All buttons), and reset back to the default configuration (re-hides
+        # non-default parts, incl. isSelectable="false" which options can't).
+        _row = layout.row(align=True)
+        _row.operator("fs25.config_show_all", text="Show All", icon='HIDE_OFF')
+        _row.operator("fs25.config_reset_default", text="Defaults",
+                      icon='LOOP_BACK')
+
+        def _header(box, key, label):
+            ex = expand.get(key, True)
+            row = box.row(align=True)
+            op = row.operator("fs25.toggle_cfg_section", text="", emboss=False,
+                              icon='TRIA_DOWN' if ex else 'TRIA_RIGHT')
+            op.section = key
+            row.label(text=label)
+            return ex
+
+        # Nicer headers for the untitled base-game config types.
+        _LABELS = {"wheelConfigurations": "Wheels",
+                   "motorConfigurations": "Motor"}
+
+        def _draw_type(t):
+            # Wheels are drawn by _draw_wheels (resolver-driven, size-expanded).
+            if t["tag"] == "wheelConfigurations":
+                return
+            # Sub-configs pinned by a configuration set are chosen via the set
+            # chooser (_draw_sets), not individually.
+            _s = entry.get("sets")
+            if _s and t["tag"][:-len("Configurations")] in _s.get("controlled", []):
+                return
+            # isSelectable="false" options exist in-game only as a dependency of
+            # another config (e.g. NH/Steyr rim) - keep their index but do not
+            # offer them as buttons. A type left with <=1 choosable option is not
+            # a real choice, so the whole section is hidden.
+            vis = [(i, o) for i, o in enumerate(t["options"])
+                   if o.get("selectable", True)]
+            if len(vis) <= 1:
+                return
             box = layout.box()
-            box.label(text=_pretty_cfg_label(t["name"]))
-            sel = entry["sel"].get(t["tag"], 0)
-            col = box.column(align=True)
-            for i, opt in enumerate(t["options"]):
-                op = col.operator("fs25.apply_store_config",
-                                  text=_pretty_cfg_label(opt["label"]),
-                                  depress=(i == sel))
-                op.config_tag = t["tag"]
-                op.option_index = i
+            label = _LABELS.get(t["tag"]) or _pretty_cfg_label(t["name"])
+            if _header(box, t["tag"], label):
+                sel = entry["sel"].get(t["tag"], 0)
+                # Yes/No (2-option) types render as a left/right group like the
+                # in-game store; longer lists stay as a vertical column.
+                container = (box.row(align=True) if len(vis) == 2
+                             else box.column(align=True))
+                for i, opt in vis:
+                    op = container.operator("fs25.apply_store_config",
+                                            text=_option_label(opt),
+                                            depress=(i == sel))
+                    op.config_tag = t["tag"]
+                    op.option_index = i
+
+        def _draw_brand():
+            br = entry.get("brand")
+            if br and br.get("options"):
+                box = layout.box()
+                if _header(box, "tireBrand", "Tire Brand"):
+                    bsel = br.get("sel", 0)
+                    col = box.column(align=True)
+                    for opt in br["options"]:
+                        op = col.operator("fs25.apply_tire_brand",
+                                          text=opt["label"],
+                                          depress=(opt["index"] == bsel))
+                        op.option_index = opt["index"]
+
+        def _draw_rimcolor():
+            rc = entry.get("rimcolor")
+            if not rc:
+                return
+            selectable = [i for i, o in enumerate(rc.get("options", []))
+                          if o.get("selectable", True)]
+            if len(selectable) <= 1:
+                return  # no real colour choice (e.g. only the stock rim)
+            box = layout.box()
+            if _header(box, "rimColor", "Rim Color"):
+                rsel = rc.get("sel", 0)
+                col = box.column(align=True)
+                for i in selectable:
+                    opt = rc["options"][i]
+                    op = col.operator("fs25.apply_rim_color",
+                                      text=_pretty_cfg_label(opt["label"]),
+                                      depress=(i == rsel))
+                    op.option_index = i
+
+        def _draw_sets():
+            s = entry.get("sets")
+            if not s or len(s.get("options", [])) <= 1:
+                return
+            box = layout.box()
+            # RAW title into the prettifier: pre-stripping "$l10n_" here left
+            # the key's namespace prefix standing ("ui_platform" ->
+            # "Ui_platform", Tigrecar); _pretty_cfg_label handles the full
+            # key correctly ("$l10n_ui_platform" -> "Platform").
+            title = (s.get("title") or "Configuration Set")
+            if _header(box, "configSets", _pretty_cfg_label(title)):
+                ssel = s.get("sel", 0)
+                col = box.column(align=True)
+                for i, opt in enumerate(s["options"]):
+                    op = col.operator("fs25.apply_config_set", text=opt["label"],
+                                      depress=(i == ssel))
+                    op.set_index = i
+
+        def _draw_wheels():
+            wo = entry.get("wheelopts")
+            if not wo or not wo.get("options"):
+                return
+            box = layout.box()
+            if _header(box, "wheels", "Wheels"):
+                wsel = wo.get("sel", -1)
+                col = box.column(align=True)
+                # "None" = the default state (no wheels loaded; the game loads
+                # them dynamically at runtime). Clicking it removes every
+                # loaded wheel part again - cleanest state for a re-export.
+                col.operator("fs25.unload_wheels", text="None",
+                             depress=(wsel < 0))
+                for i, opt in enumerate(wo["options"]):
+                    op = col.operator("fs25.load_wheel_option",
+                                      text=_pretty_cfg_label(opt["label"]),
+                                      depress=(i == wsel))
+                    op.option_index = i
+
+        # Order: Set chooser, Motor, Wheels, Tire Brand, remaining types, Rim Color.
+        types = entry.get("types", [])
+        by_tag = {t["tag"]: t for t in types}
+        drawn = {"wheelConfigurations"}   # drawn via _draw_wheels
+        _draw_sets()
+        _tm = by_tag.get("motorConfigurations")
+        if _tm:
+            _draw_type(_tm)
+            drawn.add("motorConfigurations")
+        _draw_wheels()
+        _draw_brand()
+        for _t in types:
+            if _t["tag"] not in drawn:
+                _draw_type(_t)
+        _draw_rimcolor()
 
 
 def register():
@@ -1297,9 +2152,18 @@ def register():
     bpy.utils.register_class(FS25_OT_snow_heaps_hide)
     bpy.utils.register_class(FS25_OT_invisible_ge_show)
     bpy.utils.register_class(FS25_OT_invisible_ge_hide)
+    bpy.utils.register_class(FS25_OT_config_show_all)
+    bpy.utils.register_class(FS25_OT_config_reset_default)
+    bpy.utils.register_class(FS25_OT_prepare_for_export)
     bpy.utils.register_class(FS25_OT_sync_debug_to_export_material)
     bpy.utils.register_class(FS25_OT_load_config_xml)
     bpy.utils.register_class(FS25_OT_apply_store_config)
+    bpy.utils.register_class(FS25_OT_apply_rim_color)
+    bpy.utils.register_class(FS25_OT_apply_tire_brand)
+    bpy.utils.register_class(FS25_OT_load_wheel_option)
+    bpy.utils.register_class(FS25_OT_unload_wheels)
+    bpy.utils.register_class(FS25_OT_apply_config_set)
+    bpy.utils.register_class(FS25_OT_toggle_cfg_section)
     bpy.types.Object.i3d_importer_mapping_id = StringProperty(
         name="Mapping ID", get=_i3d_mapping_id_get, set=_i3d_mapping_id_set)
     bpy.utils.register_class(FS25_PT_i3d_importer_panel)
@@ -1359,8 +2223,17 @@ def unregister():
     bpy.utils.unregister_class(FS25_PT_i3d_importer_panel)
     del bpy.types.Object.i3d_importer_mapping_id
     bpy.utils.unregister_class(FS25_OT_load_config_xml)
+    bpy.utils.unregister_class(FS25_OT_toggle_cfg_section)
+    bpy.utils.unregister_class(FS25_OT_apply_config_set)
+    bpy.utils.unregister_class(FS25_OT_load_wheel_option)
+    bpy.utils.unregister_class(FS25_OT_unload_wheels)
+    bpy.utils.unregister_class(FS25_OT_apply_tire_brand)
+    bpy.utils.unregister_class(FS25_OT_apply_rim_color)
     bpy.utils.unregister_class(FS25_OT_apply_store_config)
     bpy.utils.unregister_class(FS25_OT_sync_debug_to_export_material)
+    bpy.utils.unregister_class(FS25_OT_prepare_for_export)
+    bpy.utils.unregister_class(FS25_OT_config_reset_default)
+    bpy.utils.unregister_class(FS25_OT_config_show_all)
     bpy.utils.unregister_class(FS25_OT_invisible_ge_hide)
     bpy.utils.unregister_class(FS25_OT_invisible_ge_show)
     bpy.utils.unregister_class(FS25_OT_snow_heaps_hide)
