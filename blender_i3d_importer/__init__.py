@@ -12,7 +12,7 @@ Decodes the *.i3d.shapes binary directly in Python — no external tool needed.
 bl_info = {
     "name": "i3d Importer",
     "author": "Nadine Brinkmann",
-    "version": (0, 4, 2),
+    "version": (0, 4, 3),
     "blender": (5, 1, 0),
     "location": "File > Import > Farming Simulator i3d (.i3d)",
     "description": (
@@ -792,6 +792,10 @@ def _apply_config_xml(context, import_id, filepath, report):
             _store = json.loads(context.scene.get('_i3d_storecfg', '{}'))
             _types_d = i3d_config_parser.to_dict(_cfg_types) if _cfg_types else []
             _db = _fs25_data_base()
+            # useDefaultColors: append the game's generated palette so the
+            # picker matches the in-game colour list (q4m: 1 manual + 35).
+            if _types_d:
+                i3d_config_preview.expand_default_colors(_types_d, _db)
             # Wheel selector, resolver-driven (multi-size configs expand into one
             # option per size). Tires load on click (sel=-1), not at import.
             _wheelopts_entry = ({"options": [
@@ -846,7 +850,8 @@ def _apply_config_xml(context, import_id, filepath, report):
                     _ix = (_t.get("default", 0)
                            if _t["tag"] == "wheelConfigurations"
                            else _entry["sel"].get(_t["tag"], _t.get("default", 0)))
-                    i3d_config_preview.apply_config(import_id, _t, _ix, _db)
+                    i3d_config_preview.apply_config(import_id, _t, _ix, _db,
+                                                    entry=_entry)
     except Exception as _e:
         report({'INFO'}, "Store-config preview not loaded: %r" % _e)
     if unmatched:
@@ -1441,7 +1446,7 @@ class FS25_OT_config_reset_default(bpy.types.Operator):
                 continue
             di = ct.get("default", 0)
             sel[ct["tag"]] = di
-            i3d_config_preview.apply_config(import_id, ct, di, db)
+            i3d_config_preview.apply_config(import_id, ct, di, db, entry=entry)
         context.scene['_i3d_storecfg'] = json.dumps(store)
         self.report({'INFO'}, "Reset to default configuration")
         return {'FINISHED'}
@@ -1651,6 +1656,119 @@ def _option_label(opt):
     return ("%s %s" % (label, " ".join(params.split("|")))).strip()
 
 
+# ---------------------------------------------------------------------------
+# Colour swatches (store-config colour picker)
+# ---------------------------------------------------------------------------
+
+_color_icons = None      # bpy.utils.previews collection (runtime icons)
+_ICON_N = 32             # icon edge length in px
+
+
+def _color_icon_collection():
+    global _color_icons
+    if _color_icons is None:
+        import bpy.utils.previews
+        _color_icons = bpy.utils.previews.new()
+    return _color_icons
+
+
+def _srgb(c):
+    """linear -> sRGB (fs colours are linear; icon bytes are shown as-is)."""
+    c = max(0.0, min(1.0, c))
+    return 12.92 * c if c <= 0.0031308 else 1.055 * (c ** (1.0 / 2.4)) - 0.055
+
+
+# Finish-marker pixel patterns (local coords in a 12x12 corner field),
+# mirroring the three in-game symbols: shiny = 4-ray star, metallic =
+# 3x3 dot grid, mat = diagonal stripes.
+_FINISH_PIXELS = {
+    "s": [(5, 1), (5, 2), (5, 3), (5, 4), (5, 5), (5, 6), (5, 7), (5, 8),
+          (5, 9), (1, 5), (2, 5), (3, 5), (4, 5), (6, 5), (7, 5), (8, 5),
+          (9, 5), (4, 4), (6, 4), (4, 6), (6, 6)],
+    "m": [(x, y) for x in (2, 5, 8) for y in (2, 5, 8)],
+    "f": ([(x, x) for x in range(1, 10)]
+          + [(x, x + 4) for x in range(1, 6)]
+          + [(x, x - 4) for x in range(5, 10)]),
+}
+
+
+def _swatch_icon_id(rgb, finish):
+    """icon_id of a 32x32 colour swatch with a finish marker, generated once
+    into the runtime preview collection (ImagePreview.icon_pixels_float is
+    writable - no temp PNG files needed)."""
+    col = _color_icon_collection()
+    r, g, b = (_srgb(v) for v in rgb)
+    key = "sw_%02x%02x%02x_%s" % (int(r * 255), int(g * 255), int(b * 255),
+                                  finish)
+    p = col.get(key)
+    if p is None:
+        p = col.new(key)
+        p.icon_size = (_ICON_N, _ICON_N)
+        px = [r, g, b, 1.0] * (_ICON_N * _ICON_N)
+        # subtle darker border for separation on similar panel backgrounds
+        for k in range(_ICON_N):
+            for i in (k, (_ICON_N - 1) * _ICON_N + k,
+                      k * _ICON_N, k * _ICON_N + _ICON_N - 1):
+                px[i * 4:i * 4 + 3] = [r * 0.55, g * 0.55, b * 0.55]
+        # finish marker bottom right: white on dark, black on bright colours
+        lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
+        mc = 0.0 if lum > 0.5 else 1.0
+        for (x, y) in _FINISH_PIXELS.get(finish, ()):
+            gx, gy = _ICON_N - 14 + x, 2 + y      # icon origin = bottom left
+            if 0 <= gx < _ICON_N and 0 <= gy < _ICON_N:
+                i = (gy * _ICON_N + gx) * 4
+                px[i:i + 3] = [mc, mc, mc]
+        p.icon_pixels_float = px
+    return p.icon_id
+
+
+def _color_swatch_data(opt, ct, templates):
+    """(rgb, finish) of one colour option for its swatch icon - game UI rules
+    (VehicleConfigurationItemColor.loadFromXML): a chrome template forces
+    metallic + grey 0.3, silver grey 0.4 (both OVERRIDE uiColor), then the
+    explicit uiColor, then the resolved option colour."""
+    tpl = (opt.get("template") or "").lower()
+    is_metallic = bool(opt.get("is_metallic"))
+    rgb = None
+    if "chrome" in tpl:
+        rgb, is_metallic = (0.3, 0.3, 0.3), True
+    elif "silver" in tpl:
+        rgb = (0.4, 0.4, 0.4)
+    if rgb is None and opt.get("ui_color"):
+        v = i3d_config_preview._rgb_str(opt["ui_color"])
+        if v:
+            rgb = tuple(float(x) for x in v.split())
+    if rgb is None:
+        c, _t = i3d_config_preview._resolve_option_color(opt, ct, templates)
+        if c:
+            rgb = tuple(float(x) for x in c.split())
+    if rgb is None:
+        rgb = (1.0, 1.0, 1.0)
+    finish = "m" if is_metallic else ("f" if opt.get("is_mat") else "s")
+    return rgb, finish
+
+
+def _color_option_label(opt, templates):
+    """Readable colour name: the colour/look template's ``title`` from
+    brandMaterialTemplates when available (l10n-resolved, e.g. "Mamba Green"),
+    else the prettified raw label (SKODA_MAMBA_GREEN -> Skoda Mamba Green)."""
+    for key in ("color", "template"):
+        nm = opt.get(key) or ""
+        t = templates.get(nm)
+        if t is not None and t.get("title"):
+            ttl = t["title"]
+            # titles can themselves be l10n keys ($l10n_ui_colorSkodaEnergyBlue)
+            if ttl.startswith("$l10n_"):
+                ttl = _pretty_cfg_label(ttl)
+                if ttl.startswith("Color "):
+                    ttl = ttl[len("Color "):]
+            return ttl
+    lbl = opt.get("label") or "Option"
+    if "_" in lbl or lbl.isupper():
+        return lbl.replace("_", " ").title()
+    return _pretty_cfg_label(lbl)
+
+
 def _update_brand_options(context, import_id, entry, config_index, dim_col=0):
     """Recompute the tire-brand options for the selected wheel configuration + size
     and reset the brand selection. Each config offers only the manufacturers that
@@ -1707,6 +1825,36 @@ def _reload_wheels(context, import_id, entry, config_index, dim_col=0):
     return True
 
 
+def _config_ref_matches(m, config_name):
+    """True if material entry *m* colour-references *config_name*."""
+    if m.get("use_base_color") and config_name == "baseColor":
+        return True
+    n = m.get("use_design_color_index") or 0
+    if n and config_name == ("designColor" if n <= 1 else "designColor%d" % n):
+        return True
+    return bool(m.get("use_rim_color")) and config_name == "rimColor"
+
+
+def _reapply_color_dependents(import_id, entry, changed_tag, db):
+    """Re-apply every config type with a material entry that references the
+    changed colour configuration (VehicleConfigurationDataMaterial's use_*
+    flags resolve against the CURRENT selection, so dependants must follow a
+    colour change - e.g. the enyaq rim design option "Base Color")."""
+    cname = changed_tag[:-len("Configurations")]
+    for t in entry.get("types", []):
+        if t["tag"] == changed_tag:
+            continue
+        mats = list(t.get("color_slots") or [])
+        for o in t.get("options", []):
+            mats.extend(o.get("materials", []))
+        if not any(_config_ref_matches(m, cname) for m in mats):
+            continue
+        sel = entry.get("sel", {}).get(t["tag"], t.get("default", 0))
+        if not isinstance(sel, int) or sel < 0:
+            continue
+        i3d_config_preview.apply_config(import_id, t, sel, db, entry=entry)
+
+
 class FS25_OT_apply_store_config(Operator):
     """Apply a store-configuration option to this import (visual preview only)."""
     bl_idname = "fs25.apply_store_config"
@@ -1715,6 +1863,27 @@ class FS25_OT_apply_store_config(Operator):
 
     config_tag: StringProperty()
     option_index: IntProperty()
+
+    @classmethod
+    def description(cls, context, properties):
+        """Colour options get their colour name + price as tooltip."""
+        try:
+            obj = context.active_object
+            import_id = obj.get('_i3d_import_id') if obj else None
+            store = json.loads(context.scene.get('_i3d_storecfg', '{}'))
+            entry = store.get(import_id) or {}
+            ct = next((t for t in entry.get("types", [])
+                       if t["tag"] == properties.config_tag), None)
+            if ct and ct.get("is_color"):
+                opt = ct["options"][properties.option_index]
+                templates = i3d_config_preview._load_templates_cached(
+                    _fs25_data_base())
+                nm = _color_option_label(opt, templates)
+                pr = (opt.get("price") or "").strip()
+                return nm + ((" - %s $" % pr) if pr else "")
+        except Exception:
+            pass
+        return "Apply this store-configuration option (visual preview only)"
 
     def execute(self, context):
         obj = context.active_object
@@ -1737,8 +1906,14 @@ class FS25_OT_apply_store_config(Operator):
         if self.config_tag == "wheelConfigurations":
             _update_brand_options(context, import_id, entry, self.option_index)
         context.scene['_i3d_storecfg'] = json.dumps(store)
-        i3d_config_preview.apply_config(import_id, ct, self.option_index,
-                                       _fs25_data_base())
+        db = _fs25_data_base()
+        i3d_config_preview.apply_config(import_id, ct, self.option_index, db,
+                                        entry=entry)
+        # Changing a colour re-colours every type that references it via
+        # use_base_color / use_design_color_index / use_rim_color (enyaq rims
+        # follow the base colour while their "Base Color" option is active).
+        if ct.get("is_color"):
+            _reapply_color_dependents(import_id, entry, self.config_tag, db)
         # A wheel configuration also swaps the actual tires/rims (external i3ds).
         # Load + place them for the chosen option (replaces previously loaded
         # wheels). Only happens on click, not on the default apply at XML load.
@@ -1763,6 +1938,19 @@ class FS25_OT_apply_rim_color(Operator):
 
     option_index: IntProperty()
 
+    @classmethod
+    def description(cls, context, properties):
+        """Swatch buttons carry no text - the colour name is the tooltip."""
+        try:
+            obj = context.active_object
+            import_id = obj.get('_i3d_import_id') if obj else None
+            store = json.loads(context.scene.get('_i3d_storecfg', '{}'))
+            rc = (store.get(import_id) or {}).get("rimcolor") or {}
+            return _pretty_cfg_label(
+                rc["options"][properties.option_index]["label"])
+        except Exception:
+            return "Apply this rim colour (visual preview only)"
+
     def execute(self, context):
         obj = context.active_object
         import_id = obj.get('_i3d_import_id') if obj else None
@@ -1776,9 +1964,12 @@ class FS25_OT_apply_rim_color(Operator):
             return {'CANCELLED'}
         rc["sel"] = self.option_index
         context.scene['_i3d_storecfg'] = json.dumps(store)
+        db = _fs25_data_base()
         i3d_config_preview.apply_rim_color(
-            import_id, rc["options"][self.option_index]["template"],
-            _fs25_data_base())
+            import_id, rc["options"][self.option_index]["template"], db)
+        # use_rim_color references resolve against this section's selection.
+        _reapply_color_dependents(import_id, entry, "rimColorConfigurations",
+                                  db)
         return {'FINISHED'}
 
 
@@ -2025,14 +2216,56 @@ class FS25_PT_store_config(bpy.types.Panel):
         _LABELS = {"wheelConfigurations": "Wheels",
                    "motorConfigurations": "Motor"}
 
+        def _draw_color_type(t):
+            # Colour configuration: swatch grid like the in-game colour
+            # picker. Even a single colour is shown (the vehicle's colour is
+            # a visible property; useDefaultColors palettes grow it later).
+            vis = [(i, o) for i, o in enumerate(t["options"])
+                   if o.get("selectable", True)]
+            if not vis:
+                return
+            templates = i3d_config_preview._load_templates_cached(
+                _fs25_data_base())
+            box = layout.box()
+            if not _header(box, t["tag"], _pretty_cfg_label(t["name"])):
+                return
+            sel = entry["sel"].get(t["tag"], t.get("default", 0))
+            grid = box.grid_flow(row_major=True, columns=6, even_columns=True,
+                                 even_rows=True, align=True)
+            # Icon size follows the widget HEIGHT (verified 5.1: a scaled
+            # grid draws proportionally larger icons), so scale_y doubles
+            # the swatch size like the in-game picker.
+            grid.scale_y = 2.0
+            for i, opt in vis:
+                rgb, finish = _color_swatch_data(opt, t, templates)
+                op = grid.operator("fs25.apply_store_config", text="",
+                                   icon_value=_swatch_icon_id(rgb, finish),
+                                   depress=(i == sel))
+                op.config_tag = t["tag"]
+                op.option_index = i
+            if isinstance(sel, int) and 0 <= sel < len(t["options"]):
+                cur = t["options"][sel]
+                nm = _color_option_label(cur, templates)
+                pr = (cur.get("price") or "").strip()
+                box.label(text=nm + ((" (%s $)" % pr) if pr else ""))
+
         def _draw_type(t):
             # Wheels are drawn by _draw_wheels (resolver-driven, size-expanded).
             if t["tag"] == "wheelConfigurations":
+                return
+            # rimColor is applied by the dedicated Rim Color section (wheel
+            # loader) - drawing the parsed type too would duplicate it. The
+            # type still serves as the use_rim_color reference source.
+            if t["tag"] == "rimColorConfigurations":
                 return
             # Sub-configs pinned by a configuration set are chosen via the set
             # chooser (_draw_sets), not individually.
             _s = entry.get("sets")
             if _s and t["tag"][:-len("Configurations")] in _s.get("controlled", []):
+                return
+            # Colour configurations render as a swatch grid, not text buttons.
+            if t.get("is_color"):
+                _draw_color_type(t)
                 return
             # isSelectable="false" options exist in-game only as a dependency of
             # another config (e.g. NH/Steyr rim) - keep their index but do not
@@ -2080,14 +2313,24 @@ class FS25_PT_store_config(bpy.types.Panel):
                 return  # no real colour choice (e.g. only the stock rim)
             box = layout.box()
             if _header(box, "rimColor", "Rim Color"):
+                templates = i3d_config_preview._load_templates_cached(
+                    _fs25_data_base())
                 rsel = rc.get("sel", 0)
-                col = box.column(align=True)
+                grid = box.grid_flow(row_major=True, columns=6,
+                                     even_columns=True, even_rows=True,
+                                     align=True)
+                grid.scale_y = 2.0
                 for i in selectable:
                     opt = rc["options"][i]
-                    op = col.operator("fs25.apply_rim_color",
-                                      text=_pretty_cfg_label(opt["label"]),
-                                      depress=(i == rsel))
+                    pseudo = {"template": opt.get("template") or ""}
+                    rgb, finish = _color_swatch_data(pseudo, {}, templates)
+                    op = grid.operator("fs25.apply_rim_color", text="",
+                                       icon_value=_swatch_icon_id(rgb, finish),
+                                       depress=(i == rsel))
                     op.option_index = i
+                if 0 <= rsel < len(rc["options"]):
+                    box.label(text=_pretty_cfg_label(
+                        rc["options"][rsel].get("label") or "Option"))
 
         def _draw_sets():
             s = entry.get("sets")
@@ -2211,6 +2454,11 @@ def register():
 
 
 def unregister():
+    global _color_icons
+    if _color_icons is not None:
+        import bpy.utils.previews
+        bpy.utils.previews.remove(_color_icons)
+        _color_icons = None
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
     del bpy.types.Scene.fs25_tree_season
     del bpy.types.Scene.fs25_debug_only_active

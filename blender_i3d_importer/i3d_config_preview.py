@@ -8,6 +8,14 @@ visibility and local transforms; nothing is persisted for export.
 
 Mirrors dataS/scripts/utils/ObjectChangeUtil.lua (updateObjectChanges /
 setObjectChanges).
+
+Colour configurations (baseColor / designColor%d / rimColor / wrappingColor,
+placeable color) are applied by ``apply_color_config``: the selected option's
+colour/template is painted onto the type-level target slots and the option's
+own material entries, mirroring VehicleConfigurationItemColor.onPostLoad +
+VehicleConfigurationDataMaterial.onLoadFinished (incl. the use_base_color /
+use_design_color_index / use_rim_color references against the CURRENT
+selection of the referenced configuration).
 """
 
 import json
@@ -16,6 +24,7 @@ import os
 import bpy
 import mathutils
 
+from . import i3d_config_parser
 from . import i3d_material_templates
 
 
@@ -256,9 +265,10 @@ def apply_option(options, selected_index, id_to_obj):
 
 
 # ---------------------------------------------------------------------------
-# Material-swap configurations (design / Black Beauty): set the slot material's
-# fs25_param nodes from a resolved material template. Visual preview only;
-# debug-material parameters, shared per material.
+# Material-swap configurations (design / Black Beauty) and colour
+# configurations (baseColor / designColor%d / ...): set the slot materials'
+# fs25_param nodes from a resolved material template and/or the option colour.
+# Visual preview only; debug-material parameters, shared per material.
 # ---------------------------------------------------------------------------
 
 _TEMPLATE_CACHE = {}
@@ -343,25 +353,48 @@ def _set_mat_texture(mat, role, filepath, data_path=None):
 
 
 def _set_mat_param(mat, param, value_str):
-    """Set the fs25_param node(s) for *param* on a single material."""
+    """Set the fs25_param node(s) for *param* on a single material.
+
+    Array-parameter fallback: the building shader declares colorScale with
+    arraySize=8, so placeable materials (and our debug nodes) carry
+    colorScale0..7 instead of a plain colorScale. When no node matches the
+    plain name, element 0 is set - the only element base-game colour configs
+    observably write (every rudolfHormann mainColor material carries exactly
+    colorScale0 holding the default colour). Higher elements colour OTHER
+    regions of the material and are left alone; the engine-side behaviour of
+    setShaderParameter on them is not verifiable from the decompile."""
     if not mat.use_nodes:
         return
     vals = [float(x) for x in value_str.replace(",", " ").split()]
     if not vals:
         return
     slot_idx = {"x": 0, "y": 1, "z": 2, "w": 3, "alpha": 3}
-    for n in mat.node_tree.nodes:
-        if not n.name.startswith("fs25_param:"):
-            continue
-        if n.get("fs25_xml_param") != param:
-            continue
-        if n.bl_idname == "ShaderNodeRGB":
-            dv = n.outputs[0].default_value
-            for i in range(min(3, len(vals))):
-                dv[i] = vals[i]
-        else:
-            idx = slot_idx.get(n.get("fs25_xml_slot", "all"), 0)
-            n.outputs[0].default_value = vals[idx] if idx < len(vals) else vals[0]
+    names = (param,) if param[-1:].isdigit() else (param, param + "0")
+    for name in names:
+        hit = False
+        for n in mat.node_tree.nodes:
+            if not n.name.startswith("fs25_param:"):
+                continue
+            if n.get("fs25_xml_param") != name:
+                continue
+            hit = True
+            if n.bl_idname == "ShaderNodeRGB":
+                dv = n.outputs[0].default_value
+                for i in range(min(3, len(vals))):
+                    dv[i] = vals[i]
+            else:
+                idx = slot_idx.get(n.get("fs25_xml_slot", "all"), 0)
+                # Only set components that were actually provided: a 3-value
+                # colour must leave w untouched, exactly like the game's
+                # setShaderParameter(node, "colorScale", r, g, b, nil). The
+                # debug wiring feeds colorScale0.w into BlendFactor0, so the
+                # previous vals[0] fallback painted the blend factor with the
+                # RED component (garageSmall: dark colours stopped tinting,
+                # bright ones washed out).
+                if idx < len(vals):
+                    n.outputs[0].default_value = vals[idx]
+        if hit:
+            break
 
 
 def _capture_orig(mat):
@@ -369,17 +402,29 @@ def _capture_orig(mat):
     if mat.get("_i3d_cfg_orig") is not None or not mat.use_nodes:
         return
     orig = {}
-    for n in mat.node_tree.nodes:
-        if not n.name.startswith("fs25_param:"):
-            continue
-        p = n.get("fs25_xml_param")
-        if p not in i3d_material_templates.PARAM_ATTRS or p in orig:
-            continue
-        if n.bl_idname == "ShaderNodeRGB":
-            dv = n.outputs[0].default_value
-            orig[p] = "%g %g %g" % (dv[0], dv[1], dv[2])
-        else:
-            orig[p] = "%g" % n.outputs[0].default_value
+    # Two passes, RGB nodes first: an RGB and a scalar node can share one
+    # param name (colorScale0 -> _rgb + _w); which one got snapshotted used
+    # to depend on node order, and a scalar-first snapshot would restore
+    # only the red channel. The colour snapshot must win - the w scalar is
+    # never touched by 3-component colour applies (see _set_mat_param).
+    for rgb_pass in (True, False):
+        for n in mat.node_tree.nodes:
+            if not n.name.startswith("fs25_param:"):
+                continue
+            if (n.bl_idname == "ShaderNodeRGB") != rgb_pass:
+                continue
+            p = n.get("fs25_xml_param")
+            if p is None or p in orig:
+                continue
+            # accept array elements too (colorScale0..7, building shader);
+            # stored under the REAL node name so restore matches exactly.
+            if p.rstrip("0123456789") not in i3d_material_templates.PARAM_ATTRS:
+                continue
+            if rgb_pass:
+                dv = n.outputs[0].default_value
+                orig[p] = "%g %g %g" % (dv[0], dv[1], dv[2])
+            else:
+                orig[p] = "%g" % n.outputs[0].default_value
     mat["_i3d_cfg_orig"] = json.dumps(orig)
     tex = {}
     for role in i3d_material_templates.TEXTURE_ATTRS:
@@ -449,32 +494,228 @@ def _apply_template_to_mat(mat, resolved, color_only, data_base=None):
                     _set_mat_texture(mat, role, fp, data_path=tpath)
 
 
+# ---------------------------------------------------------------------------
+# Colour resolution (VehicleConfigurationItemColor semantics)
+# ---------------------------------------------------------------------------
+
+
+def _rgb_str(s):
+    """Normalise an ``r g b [a]`` attribute string to ``"r g b"``, or None."""
+    try:
+        vals = [float(x) for x in s.replace(",", " ").split()]
+    except (ValueError, AttributeError):
+        return None
+    if len(vals) < 3:
+        return None
+    return "%g %g %g" % (vals[0], vals[1], vals[2])
+
+
+def _template_color(name, templates):
+    """colorScale of a material template (with parentTemplate inheritance)."""
+    resolved = i3d_material_templates.resolve_template(name, templates)
+    return _rgb_str(resolved.get("colorScale") or "") if resolved else None
+
+
+def _resolve_option_color(opt, ct, templates):
+    """Effective ``(colorscale_str, template_name)`` of a colour option -
+    either may be None (VehicleConfigurationItemColor.loadFromXML + postLoad):
+
+    - ``#color`` is an RGB string OR a material-template name (colour lookup).
+    - ``#materialTemplateName`` defines the LOOK, and the colour when
+      ``#color`` is absent; an explicit ``#color`` wins (current-patch
+      semantics: ``self.color = self.color or color``).
+    - Options without a template get the type's
+      defaultColorMaterialTemplateName as look ONLY when useDefaultColors is
+      set (postLoad assigns the fallback inside that branch; the enyaq sets
+      the attribute without the flag - it is inert there, colour-only apply).
+    """
+    col = None
+    cattr = opt.get("color") or ""
+    if cattr:
+        if cattr in templates:
+            col = _template_color(cattr, templates)
+        else:
+            col = _rgb_str(cattr)
+    tpl = opt.get("template") or ""
+    if not tpl and ct.get("use_default_colors"):
+        tpl = ct.get("default_color_template") or ""
+    if col is None and tpl:
+        col = _template_color(tpl, templates)
+    return col, (tpl or None)
+
+
+def _resolve_material_reference(entry, m, templates):
+    """``(colorscale, template)`` of the configuration referenced by one of
+    the use_* flags, following the CURRENT selection in ``entry["sel"]``
+    (VehicleConfigurationDataMaterial.onLoadFinished). None when *m* carries
+    no reference or it cannot be resolved.
+
+    use_rim_color prefers the dedicated Rim-Color section
+    (``entry["rimcolor"]``, wheel-loader driven - its selection is the live
+    UI state), then the parsed rimColorConfigurations type."""
+    if not entry:
+        return None
+    cname = None
+    if m.get("use_base_color"):
+        cname = "baseColor"
+    else:
+        n = m.get("use_design_color_index") or 0
+        if n:
+            cname = "designColor" if n <= 1 else "designColor%d" % n
+        elif m.get("use_rim_color"):
+            cname = "rimColor"
+    if cname is None:
+        return None
+    if cname == "rimColor":
+        # The dedicated Rim Color section is the live UI for the rim colour
+        # (its sel updates on click; the parsed type's sel does not), so it
+        # takes precedence over the rimColorConfigurations type.
+        rc = entry.get("rimcolor")
+        if rc and rc.get("options"):
+            sel = rc.get("sel", 0)
+            if 0 <= sel < len(rc["options"]):
+                tpl = rc["options"][sel].get("template")
+                if tpl:
+                    return _template_color(tpl, templates), tpl
+    tag = cname + "Configurations"
+    for t in entry.get("types", []):
+        if t["tag"] == tag and t.get("options"):
+            sel = entry.get("sel", {}).get(tag, t.get("default", 0))
+            if not isinstance(sel, int) or not (0 <= sel < len(t["options"])):
+                sel = t.get("default", 0)
+            return _resolve_option_color(t["options"][sel], t, templates)
+    return None
+
+
+def _apply_color_to_mat(mat, col, tpl, color_only, templates, data_base):
+    """Apply an effective colour + optional look template to one material.
+    Template parameters first (colorScale only when *color_only*), then the
+    explicit colour LAST so an option colour overrides the template's."""
+    _capture_orig(mat)
+    if tpl:
+        resolved = i3d_material_templates.resolve_template(tpl, templates)
+        if resolved:
+            _apply_template_to_mat(mat, resolved, color_only, data_base)
+    if col:
+        _set_mat_param(mat, "colorScale", col)
+
+
 def capture_material_originals(import_id, types):
-    """Snapshot originals for every material referenced by a material config."""
+    """Snapshot originals for every material referenced by a material config
+    (option-level entries AND the colour configs' type-level target slots)."""
     by_slot = _import_materials_by_slot(import_id)
     for t in types:
+        for s in t.get("color_slots", []):
+            for mat in by_slot.get(s["slot"], []):
+                _capture_orig(mat)
         for o in t.get("options", []):
             for m in o.get("materials", []):
                 for mat in by_slot.get(m["slot"], []):
                     _capture_orig(mat)
 
 
-def _apply_materials(import_id, options, selected_index, data_base):
+def expand_default_colors(types, data_base):
+    """Append the game's generated default-colour palette to every colour
+    config type with useDefaultColors (VehicleConfigurationItemColor /
+    PlaceableConfigurationItemColor .postLoad): one option per palette
+    template that resolves, coloured by the brand template with the type's
+    default_color_template as look. defaultColorIndex (1-based, into the
+    palette) marks the generated default and re-points the type default.
+    The trailing in-game "Custom Color" entry is isSelectable=false and is
+    omitted. Works on the to_dict() representation and must run BEFORE the
+    entry's initial selections are derived."""
+    templates = _load_templates_cached(data_base)
+    if not templates:
+        return
+    for t in types:
+        if not (t.get("is_color") and t.get("use_default_colors")):
+            continue
+        palette = (i3d_config_parser.DEFAULT_COLORS_PLACEABLE
+                   if t["tag"] == "colorConfigurations"
+                   else i3d_config_parser.DEFAULT_COLORS_VEHICLE)
+        dci = t.get("default_color_index") or 0
+        price = t.get("color_price") or ""
+        base_tpl = t.get("default_color_template") or "calibratedPaint"
+        for i, name in enumerate(palette, 1):
+            if name not in templates:
+                continue
+            t["options"].append({
+                "label": name, "changes": [], "materials": [],
+                "selectable": True, "is_default": (i == dci), "params": "",
+                "color": name, "ui_color": "", "template": base_tpl,
+                "is_metallic": False, "is_mat": False,
+                "price": ("0" if i == dci else price)})
+        if dci:
+            for j, o in enumerate(t["options"]):
+                if o.get("is_default") and o.get("selectable", True):
+                    t["default"] = j
+                    break
+
+
+def _apply_material_entry(m, col, tpl, by_slot, templates, data_base):
+    """Paint one material entry onto its slot materials."""
+    for mat in by_slot.get(m["slot"], []):
+        _apply_color_to_mat(mat, col, tpl, m.get("color_only", False),
+                            templates, data_base)
+
+
+def _entry_color(m, entry, templates, opt_col=None, opt_tpl=None):
+    """Effective (colour, template) for one material entry: a use_* reference
+    beats the entry's own template, which beats the option colour/template."""
+    ref = _resolve_material_reference(entry, m, templates)
+    if ref is not None:
+        return ref
+    if m.get("template"):
+        return None, m["template"]
+    return opt_col, opt_tpl
+
+
+def _apply_materials(import_id, options, selected_index, data_base,
+                     entry=None, ct=None):
     by_slot = _import_materials_by_slot(import_id)
+    templates = _load_templates_cached(data_base)
     # restore every slot this config type touches, then apply the selected option
     touched = {m["slot"] for o in options for m in o.get("materials", [])}
     for slot in touched:
         for mat in by_slot.get(slot, []):
             _restore_mat(mat)
     if 0 <= selected_index < len(options):
-        templates = _load_templates_cached(data_base)
-        for m in options[selected_index].get("materials", []):
-            resolved = i3d_material_templates.resolve_template(m["template"], templates)
-            if not resolved:
-                continue
-            for mat in by_slot.get(m["slot"], []):
-                _apply_template_to_mat(mat, resolved, m.get("color_only", False),
-                                       data_base)
+        opt = options[selected_index]
+        for m in opt.get("materials", []):
+            col, tpl = _entry_color(m, entry, templates)
+            _apply_material_entry(m, col, tpl, by_slot, templates, data_base)
+
+
+def apply_color_config(import_id, entry, ct, selected_index, data_base=None):
+    """Apply a colour-configuration option: paint the type-level target slots
+    (enyaq: skodaEnyaq_baseColor_mat; placeables: mainColor_mat) and the
+    option's own material entries (enyaq interior colorOnly slots).
+
+    Mirrors VehicleConfigurationItemColor.onPostLoad: a type-level entry with
+    its own materialTemplateName is a fixed material (option-independent);
+    otherwise the selected option's colour/template is applied, honouring
+    materialTemplateUseColorOnly and the use_* references."""
+    options = ct["options"]
+    by_slot = _import_materials_by_slot(import_id)
+    templates = _load_templates_cached(data_base)
+    touched = {s["slot"] for s in ct.get("color_slots", [])}
+    touched |= {m["slot"] for o in options for m in o.get("materials", [])}
+    for slot in touched:
+        for mat in by_slot.get(slot, []):
+            _restore_mat(mat)
+    if not (0 <= selected_index < len(options)):
+        return
+    opt = options[selected_index]
+    ocol, otpl = _resolve_option_color(opt, ct, templates)
+    for s in ct.get("color_slots", []):
+        if s.get("template"):
+            col, tpl = None, s["template"]       # fixed slot material
+        else:
+            col, tpl = _entry_color(s, entry, templates, ocol, otpl)
+        _apply_material_entry(s, col, tpl, by_slot, templates, data_base)
+    for m in opt.get("materials", []):
+        col, tpl = _entry_color(m, entry, templates, ocol, otpl)
+        _apply_material_entry(m, col, tpl, by_slot, templates, data_base)
 
 
 def _enforce_visibility_hierarchy(import_id):
@@ -513,13 +754,20 @@ def _enforce_visibility_hierarchy(import_id):
             del o["_i3d_cfg_inh"]
 
 
-def apply_config(import_id, ct, selected_index, data_base=None):
-    """Apply one configuration type: objectChanges and material swaps."""
+def apply_config(import_id, ct, selected_index, data_base=None, entry=None):
+    """Apply one configuration type: objectChanges, material swaps, colours.
+
+    *entry* (the whole store-config dict of this import) enables the use_*
+    colour references; without it those entries fall back to their own
+    template (or do nothing)."""
     options = ct["options"]
     id2obj = resolve_node_objects(import_id)
     apply_option(options, selected_index, id2obj)
-    if any(o.get("materials") for o in options):
-        _apply_materials(import_id, options, selected_index, data_base)
+    if ct.get("is_color"):
+        apply_color_config(import_id, entry, ct, selected_index, data_base)
+    elif any(o.get("materials") for o in options):
+        _apply_materials(import_id, options, selected_index, data_base,
+                         entry=entry, ct=ct)
     _enforce_visibility_hierarchy(import_id)
 
 
