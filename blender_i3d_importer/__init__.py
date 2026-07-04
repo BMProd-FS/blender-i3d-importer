@@ -942,49 +942,6 @@ class FS25_PT_i3d_importer_panel(bpy.types.Panel):
         pbox.operator("fs25.prepare_for_export", text="Prepare for Export",
                       icon='CHECKMARK')
 
-        # Material switch section
-        box = layout.box()
-        box.label(text="Material Switch", icon='MATERIAL')
-        box.label(text="Debug/Toggle: selected meshes")
-        box.label(text="Export (all): every imported object")
-
-        # Debug + Toggle stay selection-scoped: greyed out without a mesh
-        # selection (unchanged limitation).
-        has_sel = any(o.type == 'MESH' for o in context.selected_objects)
-        col_sel = box.column(align=True)
-        col_sel.enabled = has_sel
-        row = col_sel.row(align=True)
-        op_dbg = row.operator("fs25.switch_materials", text="Debug")
-        op_dbg.target_kind = 'debug'
-        op_dbg.scope = 'selection'
-        op_tog = row.operator("fs25.switch_materials", text="Toggle", icon='ARROW_LEFTRIGHT')
-        op_tog.target_kind = 'toggle'
-        op_tog.scope = 'selection'
-
-        # Export (all): scene-wide, active whenever an import exists
-        # (independent of selection).
-        op_exp = box.operator("fs25.switch_materials", text="Export (all)")
-        op_exp.target_kind = 'export'
-        op_exp.scope = 'all_imported'
-
-        # i3dMappings: load a vehicle/placeable config XML and assign its
-        # <i3dMapping> ids to the imported objects (scoped to the active
-        # object's import). Greyed out until an imported object is active.
-        active = context.active_object
-        has_import = active is not None and active.get('_i3d_import_id') is not None
-        mbox = layout.box()
-        mbox.label(text="i3dMappings", icon='FILE_TEXT')
-        if has_import:
-            mbox.operator("fs25.load_config_xml", text="Load Config XML", icon='IMPORT')
-        else:
-            mbox.label(text="Select an imported object first", icon='INFO')
-
-        # Editable field for the active object's i3dMapping id, if assigned.
-        # The bracket path edits the IDProperty (dict) directly - the same
-        # storage the Giants exporter reads on export (obj["I3D_XMLconfigID"]),
-        # which the exporter's own RNA UI field fails to write in Blender 5.1+.
-        if active is not None and active.get('I3D_XMLconfigID') is not None:
-            mbox.prop(active, "i3d_importer_mapping_id", text="Mapping ID")
 
 
         # Tree season - shown only when the file actually has a
@@ -993,6 +950,38 @@ class FS25_PT_i3d_importer_panel(bpy.types.Panel):
             box = layout.box()
             box.label(text="Tree Season")
             box.prop(context.scene, "fs25_tree_season", text="")
+
+
+class FS25_PT_material_switch(bpy.types.Panel):
+    """Sub-panel: switch imported meshes between debug and re-export materials.
+
+    'Only selected' scopes the buttons to the mesh selection; otherwise they
+    act on every imported mesh in the scene."""
+    bl_idname = "FS25_PT_material_switch"
+    bl_label = "Material Switch"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "i3d Importer"
+    bl_parent_id = "FS25_PT_i3d_importer_panel"
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        only_sel = scene.fs25_matswitch_only_selected
+        layout.prop(scene, "fs25_matswitch_only_selected", text="Only selected")
+
+        # Only selected -> act on the current mesh selection; otherwise scene-
+        # wide (every imported mesh, incl. hidden helpers - safest for export).
+        scope = 'selection' if only_sel else 'all_imported'
+        has_sel = any(o.type == 'MESH' for o in context.selected_objects)
+        row = layout.row(align=True)
+        row.enabled = (has_sel or not only_sel)
+        op_dbg = row.operator("fs25.switch_materials", text="Debug material")
+        op_dbg.target_kind = 'debug'
+        op_dbg.scope = scope
+        op_exp = row.operator("fs25.switch_materials", text="Export material")
+        op_exp.target_kind = 'export'
+        op_exp.scope = scope
 
 
 class FS25_PT_material_settings(bpy.types.Panel):
@@ -1005,11 +994,12 @@ class FS25_PT_material_settings(bpy.types.Panel):
     grouped by topic (Vehicle Brand Color, Clear Coat, Multitint, ...).
     """
     bl_idname = "FS25_PT_material_settings"
-    bl_label = "FS25 Material Settings"
+    bl_label = "Material Settings"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "i3d Importer"
     bl_parent_id = "FS25_PT_i3d_importer_panel"
+    bl_options = {'DEFAULT_CLOSED'}
 
     def draw(self, context):
         layout = self.layout
@@ -1142,11 +1132,12 @@ class FS25_PT_debug_view(bpy.types.Panel):
     Modes: Normal / one of the available masks / Vertex Colors.
     """
     bl_idname = "FS25_PT_debug_view"
-    bl_label = "FS25 Debug View"
+    bl_label = "Debug View"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "i3d Importer"
     bl_parent_id = "FS25_PT_i3d_importer_panel"
+    bl_options = {'DEFAULT_CLOSED'}
 
     def draw(self, context):
         layout = self.layout
@@ -1203,7 +1194,7 @@ class FS25_OT_snow_heaps_show(bpy.types.Operator):
             if obj.get('_i3d_is_snow_heap'):
                 obj.hide_set(False)
                 n += 1
-        self.report({'INFO'}, f"Shown {n} snow/ice mesh(es)")
+        self.report({'INFO'}, f"{n} object(s) unhidden")
         return {'FINISHED'}
 
 
@@ -1220,37 +1211,44 @@ class FS25_OT_snow_heaps_hide(bpy.types.Operator):
             if obj.get('_i3d_is_snow_heap'):
                 obj.hide_set(True)
                 n += 1
-        self.report({'INFO'}, f"Hidden {n} snow/ice mesh(es)")
+        self.report({'INFO'}, f"{n} object(s) hidden")
         return {'FINISHED'}
 
 
-class FS25_PT_snow_heaps(bpy.types.Panel):
-    """Sub-panel: show/hide all snow + ice meshes in the scene.
-
-    snowHeapShader.xml covers both snow heaps and icicles (via its
-    `icicle` variation), so this panel acts on both."""
-    bl_idname = "FS25_PT_snow_heaps"
-    bl_label = "FS25 Snow + Ice"
+class FS25_PT_visibility(bpy.types.Panel):
+    """Show/hide helper: snow+ice and GE-invisible meshes. Each block only
+    appears when such objects exist; the whole panel hides when neither does."""
+    bl_idname = "FS25_PT_visibility"
+    bl_label = "Visibility"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "i3d Importer"
     bl_parent_id = "FS25_PT_i3d_importer_panel"
 
+    @classmethod
+    def poll(cls, context):
+        objs = context.scene.objects
+        return any(o.get('_i3d_is_snow_heap') or o.get('_i3d_invisible_in_ge')
+                   for o in objs)
+
     def draw(self, context):
         layout = self.layout
-        layout.label(text="Unhide the snow features before export",
-                     icon='INFO')
-        count = sum(1 for o in context.scene.objects
-                    if o.get('_i3d_is_snow_heap'))
-        if count == 0:
-            layout.label(text="No snow / ice meshes in scene", icon='INFO')
-            return
-        layout.label(text=f"{count} snow / ice mesh(es) found", icon='FREEZE')
-        row = layout.row(align=True)
-        row.operator("fs25.snow_heaps_show", text="Show All",
-                     icon='HIDE_OFF')
-        row.operator("fs25.snow_heaps_hide", text="Hide All",
-                     icon='HIDE_ON')
+        objs = context.scene.objects
+        snow = sum(1 for o in objs if o.get('_i3d_is_snow_heap'))
+        ge = sum(1 for o in objs if o.get('_i3d_invisible_in_ge'))
+
+        if snow:
+            box = layout.box()
+            box.label(text="Snow & Ice", icon='FREEZE')
+            row = box.row(align=True)
+            row.operator("fs25.snow_heaps_show", text=f"Show {snow}", icon='HIDE_OFF')
+            row.operator("fs25.snow_heaps_hide", text=f"Hide {snow}", icon='HIDE_ON')
+        if ge:
+            box = layout.box()
+            box.label(text="Invisible in GE", icon='GHOST_ENABLED')
+            row = box.row(align=True)
+            row.operator("fs25.invisible_ge_show", text=f"Show {ge}", icon='HIDE_OFF')
+            row.operator("fs25.invisible_ge_hide", text=f"Hide {ge}", icon='HIDE_ON')
 
 
 # ---------------------------------------------------------------------------
@@ -1274,7 +1272,7 @@ class FS25_OT_invisible_ge_show(bpy.types.Operator):
             if obj.get('_i3d_invisible_in_ge'):
                 obj.hide_set(False)
                 n += 1
-        self.report({'INFO'}, f"Shown {n} GE-invisible object(s)")
+        self.report({'INFO'}, f"{n} object(s) unhidden")
         return {'FINISHED'}
 
 
@@ -1291,7 +1289,7 @@ class FS25_OT_invisible_ge_hide(bpy.types.Operator):
             if obj.get('_i3d_invisible_in_ge'):
                 obj.hide_set(True)
                 n += 1
-        self.report({'INFO'}, f"Hidden {n} GE-invisible object(s)")
+        self.report({'INFO'}, f"{n} object(s) hidden")
         return {'FINISHED'}
 
 
@@ -1533,35 +1531,6 @@ class FS25_OT_prepare_for_export(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class FS25_PT_invisible_ge_objects(bpy.types.Panel):
-    """Sub-panel: show/hide all objects marked invisible in the
-    Giants Editor (visibility=false or nonRenderable=true without
-    terrainDecal=true). Flagged via the _i3d_invisible_in_ge custom
-    property on import."""
-    bl_idname = "FS25_PT_invisible_ge_objects"
-    bl_label = "FS25 Invisible GE-objects"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = "i3d Importer"
-    bl_parent_id = "FS25_PT_i3d_importer_panel"
-
-    def draw(self, context):
-        layout = self.layout
-        layout.label(text="Unhide the hidden GE objects before export",
-                     icon='INFO')
-        count = sum(1 for o in context.scene.objects
-                    if o.get('_i3d_invisible_in_ge'))
-        if count == 0:
-            layout.label(text="No GE-invisible objects in scene",
-                         icon='INFO')
-            return
-        layout.label(text=f"{count} GE-invisible object(s) found",
-                     icon='GHOST_ENABLED')
-        row = layout.row(align=True)
-        row.operator("fs25.invisible_ge_show", text="Show All",
-                     icon='HIDE_OFF')
-        row.operator("fs25.invisible_ge_hide", text="Hide All",
-                     icon='HIDE_ON')
 
 
 def menu_func_import(self, context):
@@ -2207,25 +2176,35 @@ class FS25_OT_toggle_cfg_section(Operator):
 class FS25_PT_store_config(bpy.types.Panel):
     """Store-configuration preview - switch design / work-area / etc. live."""
     bl_idname = "FS25_PT_store_config"
-    bl_label = "Store Config (preview)"
+    bl_label = "Store Config & i3dMappings"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "i3d Importer"
-    bl_options = {'DEFAULT_CLOSED'}
 
     def draw(self, context):
         layout = self.layout
         obj = context.active_object
         import_id = obj.get('_i3d_import_id') if obj else None
+
+        # i3dMappings: load a config XML for the active import (moved here from
+        # the main panel - both are about loading extra XMLs).
+        mbox = layout.box()
+        mbox.label(text="i3dMappings", icon='FILE_TEXT')
+        if import_id is not None:
+            mbox.operator("fs25.load_config_xml", text="Load Config XML", icon='IMPORT')
+        else:
+            mbox.label(text="Select an imported object first", icon='INFO')
+        if obj is not None and obj.get('I3D_XMLconfigID') is not None:
+            mbox.prop(obj, "i3d_importer_mapping_id", text="Mapping ID")
+
         if import_id is None:
-            layout.label(text="Select an imported object", icon='INFO')
             return
         store = json.loads(context.scene.get('_i3d_storecfg', '{}'))
         entry = store.get(import_id)
         if not entry or not (entry.get("types") or entry.get("rimcolor")
                              or entry.get("wheelopts") or entry.get("sets")):
             layout.label(text="No store configurations loaded", icon='INFO')
-            layout.label(text="Use i3dMappings > Load Config XML")
+            layout.label(text="Use Load Config XML above")
             return
         expand = entry.get("expand", {})
 
@@ -2445,13 +2424,13 @@ def register():
         name="Mapping ID", get=_i3d_mapping_id_get, set=_i3d_mapping_id_set)
     bpy.utils.register_class(FS25_PT_i3d_importer_panel)
     # Sub-panel order (top -> bottom in the N-Panel):
-    #   1. FS25 Snow + Ice
-    #   2. FS25 Invisible GE-objects
-    #   3. FS25 Material Settings
-    #   4. FS25 Debug View
-    bpy.utils.register_class(FS25_PT_snow_heaps)
-    bpy.utils.register_class(FS25_PT_invisible_ge_objects)
+    #   1. Material Switch
+    #   2. Material Settings
+    #   3. Visibility
+    #   4. Debug View
+    bpy.utils.register_class(FS25_PT_material_switch)
     bpy.utils.register_class(FS25_PT_material_settings)
+    bpy.utils.register_class(FS25_PT_visibility)
     bpy.utils.register_class(FS25_PT_debug_view)
     bpy.utils.register_class(FS25_PT_store_config)
     bpy.types.Scene.fs25_debug_mode = EnumProperty(
@@ -2467,6 +2446,12 @@ def register():
                     "apply to every FS25 material in the file.",
         default=False,
         update=_on_debug_mode_change,
+    )
+    bpy.types.Scene.fs25_matswitch_only_selected = BoolProperty(
+        name="Only selected",
+        description="When set, the Material Switch buttons act only on the "
+                    "selected meshes; otherwise on every imported mesh.",
+        default=False,
     )
     bpy.types.Scene.fs25_tree_season = EnumProperty(
         name="Tree Season",
@@ -2495,13 +2480,14 @@ def unregister():
         _color_icons = None
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
     del bpy.types.Scene.fs25_tree_season
+    del bpy.types.Scene.fs25_matswitch_only_selected
     del bpy.types.Scene.fs25_debug_only_active
     del bpy.types.Scene.fs25_debug_mode
     bpy.utils.unregister_class(FS25_PT_store_config)
     bpy.utils.unregister_class(FS25_PT_debug_view)
+    bpy.utils.unregister_class(FS25_PT_visibility)
     bpy.utils.unregister_class(FS25_PT_material_settings)
-    bpy.utils.unregister_class(FS25_PT_invisible_ge_objects)
-    bpy.utils.unregister_class(FS25_PT_snow_heaps)
+    bpy.utils.unregister_class(FS25_PT_material_switch)
     bpy.utils.unregister_class(FS25_PT_i3d_importer_panel)
     del bpy.types.Object.i3d_importer_mapping_id
     bpy.utils.unregister_class(FS25_OT_load_config_xml)
