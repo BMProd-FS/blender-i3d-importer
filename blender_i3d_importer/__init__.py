@@ -1215,9 +1215,75 @@ class FS25_OT_snow_heaps_hide(bpy.types.Operator):
         return {'FINISHED'}
 
 
+# ---------------------------------------------------------------------------
+# Level of Detail (LOD)
+# A TransformGroup carrying lodDistance is a LOD group (obj['i3D_lod']=True);
+# its children are the LOD levels in scene-graph order (child 0 = LOD0, 1 =
+# LOD1, ...). A child's level is the trailing index of its _i3d_node_path
+# (its sibling index under the group), independent of the optional sort prefix.
+# ---------------------------------------------------------------------------
+
+def _lod_children_levels(parent):
+    """[(child, level), ...] for a LOD group's direct children.
+
+    level = trailing index of _i3d_node_path (0-based sibling index == LOD
+    level). Falls back to the 4-digit sort-order name prefix, else Blender's
+    child order, assigning 0..n."""
+    kids = list(parent.children)
+    lvl_map = []
+    for c in kids:
+        p = c.get('_i3d_node_path')
+        seg = re.split(r'[>|]', p)[-1] if p else ""
+        if seg.isdigit():
+            lvl_map.append((c, int(seg)))
+        else:
+            lvl_map = None
+            break
+    if lvl_map is not None and kids:
+        return lvl_map
+    def _key(c):
+        m = re.match(r'^(\d{4})', c.name or "")
+        return (0, int(m.group(1))) if m else (1, c.name or "")
+    return [(c, i) for i, c in enumerate(sorted(kids, key=_key))]
+
+
+class FS25_OT_set_lod_level(bpy.types.Operator):
+    """Show one LOD level and hide the others across every LOD group in the
+    scene. For each group (obj['i3D_lod']=True) the child subtree at the chosen
+    level is shown via the Outliner eye and the other level subtrees hidden;
+    objects outside any LOD group are left untouched."""
+    bl_idname = "fs25.set_lod_level"
+    bl_label = "Set LOD level"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    level: bpy.props.IntProperty(name="LOD level", default=0, min=0)
+
+    def execute(self, context):
+        shown = hidden = groups = 0
+        for parent in context.scene.objects:
+            if not parent.get('i3D_lod'):
+                continue
+            groups += 1
+            for child, lvl in _lod_children_levels(parent):
+                show = (lvl == self.level)
+                subtree = [child] + list(child.children_recursive)
+                for o in subtree:
+                    o.hide_set(not show)
+                if show:
+                    shown += len(subtree)
+                else:
+                    hidden += len(subtree)
+        if groups == 0:
+            self.report({'WARNING'}, "No LOD groups in scene")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"LOD{self.level}: {shown} shown, {hidden} hidden")
+        return {'FINISHED'}
+
+
 class FS25_PT_visibility(bpy.types.Panel):
-    """Show/hide helper: snow+ice and GE-invisible meshes. Each block only
-    appears when such objects exist; the whole panel hides when neither does."""
+    """Show/hide helper: LOD levels, snow+ice and GE-invisible meshes. Each
+    block only appears when relevant objects exist; the whole panel hides when
+    none do."""
     bl_idname = "FS25_PT_visibility"
     bl_label = "Visibility"
     bl_space_type = 'VIEW_3D'
@@ -1229,13 +1295,21 @@ class FS25_PT_visibility(bpy.types.Panel):
     def poll(cls, context):
         objs = context.scene.objects
         return any(o.get('_i3d_is_snow_heap') or o.get('_i3d_invisible_in_ge')
-                   for o in objs)
+                   or o.get('i3D_lod') for o in objs)
 
     def draw(self, context):
         layout = self.layout
         objs = context.scene.objects
         snow = sum(1 for o in objs if o.get('_i3d_is_snow_heap'))
         ge = sum(1 for o in objs if o.get('_i3d_invisible_in_ge'))
+        has_lod = any(o.get('i3D_lod') for o in objs)
+
+        if has_lod:
+            box = layout.box()
+            box.label(text="Level of Detail (LOD)", icon='MOD_DECIM')
+            row = box.row(align=True)
+            row.operator("fs25.set_lod_level", text="LOD0").level = 0
+            row.operator("fs25.set_lod_level", text="LOD1").level = 1
 
         if snow:
             box = layout.box()
@@ -2408,6 +2482,7 @@ def register():
     bpy.utils.register_class(FS25_OT_snow_heaps_hide)
     bpy.utils.register_class(FS25_OT_invisible_ge_show)
     bpy.utils.register_class(FS25_OT_invisible_ge_hide)
+    bpy.utils.register_class(FS25_OT_set_lod_level)
     bpy.utils.register_class(FS25_OT_config_show_all)
     bpy.utils.register_class(FS25_OT_config_reset_default)
     bpy.utils.register_class(FS25_OT_prepare_for_export)
@@ -2504,6 +2579,7 @@ def unregister():
     bpy.utils.unregister_class(FS25_OT_config_show_all)
     bpy.utils.unregister_class(FS25_OT_invisible_ge_hide)
     bpy.utils.unregister_class(FS25_OT_invisible_ge_show)
+    bpy.utils.unregister_class(FS25_OT_set_lod_level)
     bpy.utils.unregister_class(FS25_OT_snow_heaps_hide)
     bpy.utils.unregister_class(FS25_OT_snow_heaps_show)
     bpy.utils.unregister_class(FS25_OT_switch_materials)
