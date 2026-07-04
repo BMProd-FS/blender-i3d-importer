@@ -725,19 +725,30 @@ def _apply_config_xml(context, import_id, filepath, report):
     by_path = {}
     for mid, npath in mappings:
         by_path.setdefault(npath, mid)
+
+    def _path_segments(p):
+        # "0>0|8|4" -> ('0','0','8','4'); "0>" -> ('0',). Segment-wise, so a
+        # ReferenceNode path is a clean prefix test against a mapping path.
+        head, _sep, tail = p.partition('>')
+        return (head,) + tuple(tail.split('|')) if tail else (head,)
+
     path_index = {}
+    ref_nodes = []  # (segments, referenced_filename) for imported ReferenceNodes
     for obj in context.scene.objects:
         if obj.get('_i3d_import_id') != import_id:
             continue
         pth = obj.get('_i3d_node_path')
         if pth:
             path_index.setdefault(pth, []).append(obj)
+            _rn = obj.get('i3D_referenceFilename')
+            if _rn:
+                ref_nodes.append((_path_segments(pth), _rn))
     applied = 0
     unmatched = []
     for npath, mid in by_path.items():
         objs = path_index.get(npath)
         if not objs:
-            unmatched.append(mid)
+            unmatched.append((mid, npath))
             continue
         for obj in objs:
             obj['I3D_XMLconfigID'] = mid
@@ -855,9 +866,32 @@ def _apply_config_xml(context, import_id, filepath, report):
     except Exception as _e:
         report({'INFO'}, "Store-config preview not loaded: %r" % _e)
     if unmatched:
-        report({'WARNING'},
-               "%d i3dMapping(s) not assigned (no matching object - e.g. a "
-               "skinned bone/joint): %s" % (len(unmatched), ", ".join(unmatched)))
+        # Split unmatched mappings: those whose node path runs INTO an imported
+        # ReferenceNode (the target lives in the referenced i3d, which we do not
+        # import - the mapping is lost) vs. the rest (e.g. skinned bones/joints).
+        _ref_lost = {}   # referenced filename -> [mid, ...]
+        _other = []
+        for _mid, _np in unmatched:
+            _segs = _path_segments(_np)
+            _best = None  # (prefix_len, filename)
+            for _rsegs, _rname in ref_nodes:
+                if len(_rsegs) < len(_segs) and _segs[:len(_rsegs)] == _rsegs:
+                    if _best is None or len(_rsegs) > _best[0]:
+                        _best = (len(_rsegs), _rname)
+            if _best is not None:
+                _ref_lost.setdefault(_best[1], []).append(_mid)
+            else:
+                _other.append(_mid)
+        for _fname, _mids in _ref_lost.items():
+            report({'WARNING'},
+                   "%d i3dMapping(s) not assigned because they point into the "
+                   "referenced i3d file (%s): %s. We do not import the referenced "
+                   "i3d, therefore the mapping is lost."
+                   % (len(_mids), _fname, ", ".join(_mids)))
+        if _other:
+            report({'WARNING'},
+                   "%d i3dMapping(s) not assigned (no matching object - maybe because it's a "
+                   "skinned bone/joint): %s" % (len(_other), ", ".join(_other)))
     msg = "Applied %d i3dMapping(s) to import '%s' from %d entries" % (
         applied, import_id, len(by_path))
     if unmatched:

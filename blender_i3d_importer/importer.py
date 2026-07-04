@@ -428,6 +428,17 @@ def import_i3d(i3d_filepath: str, report: Callable = None,
                 f"{counts['shapes_missing_objx']} shapes without .objx, "
                 f"{len(material_cache)} material(s), {len(image_cache)} image(s) loaded")
 
+        # Warn about mod-local custom maps that won't survive re-export unless
+        # the .blend is saved in the mod folder (GitHub #41).
+        _modlocal_cm = getattr(scene, '_modlocal_custommaps', [])
+        if _modlocal_cm:
+            _cm_files = sorted({p for (_mat, _nm, p) in _modlocal_cm})
+            _report('WARNING',
+                    f"SAVE YOUR BLEND FILE to the i3d folder! {len(_modlocal_cm)} relative paths detected. "
+                    f"These only re-export correctly if you save your .blend in the same folder "
+                    f"as the imported .i3d. Relative paths were: {', '.join(_cm_files)}")
+            warning_count += 1
+
         if counts['shapes_missing_objx'] > 0:
             warning_count += counts['shapes_missing_objx']
 
@@ -2161,6 +2172,14 @@ def _apply_material_custom_properties(mat, mat_attrs, scene, report, mat_name):
             path = scene.files.get(fid)
             if path:
                 mat[f'customTexture_{name}'] = path
+                # Mod-local (non-$data) custom maps: the Giants exporter resolves
+                # customTexture_* paths relative to the .blend folder (no isabs
+                # handling), so these only survive re-export when the .blend is
+                # saved next to the mod's textures. Collected for one summary
+                # warning at the end of import (GitHub #41).
+                if not str(path).startswith('$'):
+                    scene.__dict__.setdefault('_modlocal_custommaps', []).append(
+                        (mat_name, name, path))
             else:
                 report('WARNING',
                        f"Material '{mat_name}': custom map '{name}' fileId {fid} not in <Files>")
