@@ -326,7 +326,7 @@ def import_i3d(i3d_filepath: str, report: Callable = None,
 
         if add_sort_order_prefix:
             _skin_excluded_ids = set()
-            _collect_skinweight_excluded_ids(roots_to_process, _skin_excluded_ids)
+            _collect_skinweight_excluded_ids(roots_to_process, shape_map, _skin_excluded_ids)
             _apply_sort_order_prefix(roots_to_process, _skin_excluded_ids)
 
         for ri, root in enumerate(roots_to_process):
@@ -508,35 +508,30 @@ def _strip_sort_prefix(name):
     return re.sub(r"^\d{4}(?:\.\d+)?:", "", name or "")
 
 
-def _collect_skinweight_excluded_ids(nodes, excluded):
-    """Collect nodeIds of skin-weights SHAPES (only the mesh, NOT its bind
-    joints) so they are NOT given a sort-order prefix.
+def _collect_skinweight_excluded_ids(nodes, shape_map, excluded):
+    """Collect nodeIds of armature-skin MESHES so they are NOT given a sort-order
+    prefix. Prefixing the skin mesh breaks the Giants exporter's skin binding
+    (#13) - the mesh must keep its raw name. The bind JOINTS are prefixed as
+    normal (their order must be preserved for #37).
 
-    The bind joints must now KEEP the prefix: since #37 they stay in the
-    hierarchy as plain TransformGroups (the bone that skins the mesh is a
-    separate "<joint>_skin" node), and their sibling order is only reproduced on
-    re-export when they carry the sort key. Prefixing the joint no longer breaks
-    the skin linkage (the exporter keys skinning by armature+bone name, and the
-    bone name is derived from the STRIPPED joint name), unlike the old model
-    where the joint itself became the bone (#13 / #6).
-
-    The skin mesh shape itself is left unprefixed conservatively (its safety
-    under prefixing is still to be confirmed by round-trip QA). Skin-weights is
-    distinguished from a merge group by the rule (verified against base-game
-    files): a skin-weights shape's own nodeId is NOT the first entry of
-    skinBindNodeIds, whereas a merge-group root lists itself first. Merge groups
-    are therefore left prefixed."""
+    Classification uses the binary shape flag `is_armature_skin` (from the
+    .i3d.shapes options: has_skin AND not single-blend), NOT the
+    skinBindNodeIds[0] != own-nodeId heuristic. The heuristic is unreliable: a
+    MERGE group can also have bind[0] != own when its shape carrier is a separate
+    node from the merge root member (external root member, e.g. UX5201Super
+    connectionHoses nodeId 28 / skinBindNodeIds[0]=30). Such a merge group must
+    stay prefixed, so keying off the binary flag avoids mis-excluding it."""
     for n in nodes:
-        sb = (n.raw_attrs or {}).get("skinBindNodeIds")
-        if sb:
+        sid = (n.raw_attrs or {}).get("shapeId")
+        if sid is not None:
             try:
-                ids = [int(x) for x in sb.split()]
-            except ValueError:
-                ids = []
-            if ids and ids[0] != n.nodeId:        # skin-weights, not merge group
-                excluded.add(n.nodeId)            # only the skin mesh shape
+                shp = shape_map.get(int(sid))
+            except (TypeError, ValueError):
+                shp = None
+            if shp is not None and shp.is_armature_skin:
+                excluded.add(n.nodeId)
         if n.children:
-            _collect_skinweight_excluded_ids(n.children, excluded)
+            _collect_skinweight_excluded_ids(n.children, shape_map, excluded)
 
 
 def _apply_sort_order_prefix(nodes, excluded=None):
@@ -3038,12 +3033,16 @@ def _process_merge_groups(import_collection, shape_map, shape_id_to_obj, report)
                    f"{root_obj.name}: skinBindNodeIds empty — MergeGroup split skipped")
             continue
 
-        # Sanity: the first bind id should equal the mesh's own nodeId
+        # The merge-group root member is skinBindNodeIds[0]. Usually that is the
+        # shape carrier's own node; when it differs, the carrier is a separate
+        # container node and slot 0 is placed on bind_ids[0]'s node instead (see
+        # the own_is_root_member branch below). Informational, not an error.
         own_nid = int(root_obj.get('_i3d_nodeId', -1))
         if bind_ids[0] != own_nid:
-            report('WARNING',
-                   f"{root_obj.name}: first skinBindNodeId {bind_ids[0]} != own "
-                   f"nodeId {own_nid} — split anyway, results may be wrong")
+            report('INFO',
+                   f"{root_obj.name}: external merge-group root member "
+                   f"(skinBindNodeId[0]={bind_ids[0]} != own nodeId {own_nid}); "
+                   f"slot 0 placed on the root member, carrier kept as a container TG")
 
         mg_counter += 1
         if mg_counter > 9:
@@ -3220,30 +3219,22 @@ def _process_merge_groups(import_collection, shape_map, shape_id_to_obj, report)
                 )
             return mdb
 
-        # -------- Slot 0: replace root_obj's mesh with the slot-0 sub-mesh --------
-        old_mesh = root_obj.data
-        new_mesh = _build_sub_mesh(
-            old_mesh.name + "_mg0",
-            per_slot_verts[0], per_slot_tris[0], per_slot_face_subsets[0],
-        )
-        root_obj.data = new_mesh
-        if old_mesh.users == 0:
-            _bpy.data.meshes.remove(old_mesh, do_unlink=True)
+        # Merge-group root member = skinBindNodeIds[0]. Normally that IS the
+        # shape carrier's own node (bind_ids[0] == own_nid), so slot 0 stays on
+        # root_obj. But some assets carry the merged shape on a SEPARATE node
+        # from the root member (external root member, e.g. UX5201Super
+        # connectionHoses: Shape nodeId 28, skinBindNodeIds[0]=30). Then slot 0
+        # belongs to bind_ids[0]'s node, not the carrier - putting it on the
+        # carrier (which sits at its parent's origin) makes that sub-mesh cluster
+        # at the origin. Handle both cases.
+        own_is_root_member = (bind_ids[0] == own_nid)
 
-        root_obj['i3D_mergeGroup'] = mg_num
-        root_obj['i3D_mergeGroupRoot'] = True
-
-        # Render-relevant properties to inherit from root onto each sub-member.
-        # The original XML had them only on the root <Shape>; the source TGs
-        # were plain <TransformGroup> with no render attributes. After the
-        # split the sub-members carry real geometry, so they should render
-        # with the same shadow/clip-distance/etc. as the root.
-        # We do NOT inherit:
-        #   - i3D_mergeGroup* (set explicitly per member)
-        #   - physics props (dynamic/compound/static/kinematic/collisionFilter*)
-        #     because re-export should treat each member as a TG without its
-        #     own physics body — the Giants exporter only reads them off the
-        #     parent shape.
+        # Render-relevant properties to inherit from the shape carrier onto each
+        # sub-member. Captured BEFORE any conversion below. The original XML had
+        # them only on the root <Shape>; the split sub-members carry real
+        # geometry, so they should render with the same shadow/clip-distance/etc.
+        # NOT inherited: i3D_mergeGroup* (set per member); physics props (the
+        # Giants exporter only reads those off the parent shape).
         _INHERIT_RENDER_PROPS = (
             'i3D_castsShadows', 'i3D_receiveShadows', 'i3D_nonRenderable',
             'i3D_clipDistance', 'i3D_objectMask', 'i3D_navMeshMask',
@@ -3257,8 +3248,70 @@ def _process_merge_groups(import_collection, shape_map, shape_id_to_obj, report)
             if prop_name in root_obj.keys():
                 inherited[prop_name] = root_obj[prop_name]
 
-        # -------- Slots 1..N-1: replace source-TG Empties with Mesh objects --------
-        for slot_idx in range(1, num_slots):
+        def _convert_to_empty(obj):
+            """Turn a Mesh object into a plain Empty in place (preserving name,
+            world transform, parent, children and custom props). Used when the
+            shape carrier is NOT itself a merge member: it becomes a container
+            TransformGroup and its merged geometry is distributed to the member
+            nodes below."""
+            old_name = obj.name
+            old_world = obj.matrix_world.copy()
+            old_parent = obj.parent
+            old_children = list(obj.children)
+            old_child_worlds = {c.name: c.matrix_world.copy() for c in old_children}
+            old_props = {k: obj[k] for k in obj.keys()}
+            old_data = obj.data
+            for coll in list(obj.users_collection):
+                coll.objects.unlink(obj)
+            obj.name = old_name + "__to_remove"
+            _bpy.data.objects.remove(obj, do_unlink=True)
+            if old_data is not None and old_data.users == 0:
+                _bpy.data.meshes.remove(old_data, do_unlink=True)
+            empty = _bpy.data.objects.new(name=old_name, object_data=None)
+            for k, v in old_props.items():
+                if k == '_RNA_UI':
+                    continue
+                try:
+                    empty[k] = v
+                except Exception:
+                    pass
+            empty['_i3d_kind'] = 'TransformGroup'
+            if old_parent is not None:
+                empty.parent = old_parent
+            import_collection.objects.link(empty)
+            empty.matrix_world = old_world
+            for child in old_children:
+                cw = old_child_worlds.get(child.name)
+                child.parent = empty
+                if cw is not None:
+                    child.matrix_world = cw
+            return empty
+
+        if own_is_root_member:
+            # -------- Slot 0: replace root_obj's mesh with the slot-0 sub-mesh --
+            old_mesh = root_obj.data
+            new_mesh = _build_sub_mesh(
+                old_mesh.name + "_mg0",
+                per_slot_verts[0], per_slot_tris[0], per_slot_face_subsets[0],
+            )
+            root_obj.data = new_mesh
+            if old_mesh.users == 0:
+                _bpy.data.meshes.remove(old_mesh, do_unlink=True)
+            root_obj['i3D_mergeGroup'] = mg_num
+            root_obj['i3D_mergeGroupRoot'] = True
+            root_member_obj = root_obj
+            start_slot = 1
+        else:
+            # External root member: the carrier holds no geometry of its own.
+            # Turn it into a container TG; slot 0 is placed on bind_ids[0]'s node
+            # in the loop below (start_slot = 0).
+            root_obj = _convert_to_empty(root_obj)
+            node_id_to_obj[own_nid] = root_obj
+            root_member_obj = None  # set when slot 0 is built in the loop
+            start_slot = 0
+
+        # -------- Slots: replace source-TG Empties with Mesh objects --------
+        for slot_idx in range(start_slot, num_slots):
             source_nid = bind_ids[slot_idx]
             source_obj = node_id_to_obj.get(source_nid)
             if source_obj is None:
@@ -3300,20 +3353,15 @@ def _process_merge_groups(import_collection, shape_map, shape_id_to_obj, report)
                     except Exception:
                         pass
                 # Order: parent FIRST, then link to collection, THEN set
-                # matrix_world. Setting matrix_world makes Blender compute
-                # the correct matrix_local + matrix_parent_inverse so the
-                # mesh ends up at exactly the old empty's world position,
-                # regardless of any inverse-matrix quirks from the previous
-                # parent-set.
+                # matrix_world so Blender computes the correct matrix_local +
+                # matrix_parent_inverse and the mesh ends up at exactly the old
+                # empty's world position.
                 if old_parent is not None:
                     mesh_obj.parent = old_parent
                 import_collection.objects.link(mesh_obj)
                 mesh_obj.matrix_world = old_world
 
-                # Re-parent former Empty children. Use the same world-space
-                # approach: cache world, reparent, restore world. Blender
-                # adjusts matrix_parent_inverse internally to satisfy the
-                # requested world matrix.
+                # Re-parent former Empty children (same world-space approach).
                 for child in old_children:
                     cw = old_child_worlds.get(child.name)
                     child.parent = mesh_obj
@@ -3328,15 +3376,22 @@ def _process_merge_groups(import_collection, shape_map, shape_id_to_obj, report)
                 # Already a mesh somehow — just swap its data block.
                 source_obj.data = slot_mesh
 
+            is_root_member = (slot_idx == 0)
             source_obj['i3D_mergeGroup'] = mg_num
-            source_obj['i3D_mergeGroupRoot'] = False
+            source_obj['i3D_mergeGroupRoot'] = is_root_member
+            if is_root_member:
+                root_member_obj = source_obj
             # Root-space merge groups (noBindPose flag absent on the shape) need
-            # the post-axis local-space fix. Bone-local shapes (FS25-Giants) skip.
-            # Covers FS22 v7 AND Giants-Blender-exporter v10 outputs (#2 / #8).
-            if not getattr(shape, 'no_bind_pose', False):
-                source_obj['_i3d_rootspace_mg_root'] = root_obj.name
-            # Inherit render-relevant properties from root (only if not already
-            # set on the member — e.g. _i3d_raw_* and userAttributes survive).
+            # the post-axis local-space fix, mapped from the ROOT MEMBER's space.
+            # Bone-local shapes (FS25-Giants) skip. Covers FS22 v7 AND
+            # Giants-Blender-exporter v10 outputs (#2 / #8).
+            if (not is_root_member
+                    and not getattr(shape, 'no_bind_pose', False)
+                    and root_member_obj is not None):
+                source_obj['_i3d_rootspace_mg_root'] = root_member_obj.name
+            # Inherit render-relevant properties from the carrier (only if not
+            # already set on the member — e.g. _i3d_raw_* and userAttributes
+            # survive).
             for _ip_name, _ip_val in inherited.items():
                 if _ip_name not in source_obj.keys():
                     try:
@@ -3345,7 +3400,7 @@ def _process_merge_groups(import_collection, shape_map, shape_id_to_obj, report)
                         pass
 
         # Drop the informational raw attr now that we've consumed it.
-        if '_i3d_skinBindNodeIds_raw' in root_obj.keys():
+        if root_obj is not None and '_i3d_skinBindNodeIds_raw' in root_obj.keys():
             del root_obj['_i3d_skinBindNodeIds_raw']
 
         report('INFO',
