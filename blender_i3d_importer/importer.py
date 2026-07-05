@@ -151,6 +151,7 @@ def import_i3d(i3d_filepath: str, report: Callable = None,
 
     i3d = Path(i3d_filepath)
     i3d_dir = i3d.parent
+    _t_import_start = time.perf_counter()
 
     # 1. Parse XML
     try:
@@ -230,12 +231,19 @@ def import_i3d(i3d_filepath: str, report: Callable = None,
 
             call_start_time = time.time()
             _report('INFO', f"Reading shapes binary: {shapes_file.name}")
+            _t_read = time.perf_counter()
             try:
                 shapes_container = i3d_shapes_reader.read_shapes_file(str(shapes_file))
             except Exception as e:
                 raise RuntimeError(
                     f"Failed to decode {shapes_file.name}: {type(e).__name__}: {e}"
                 ) from e
+            _read_secs = time.perf_counter() - _t_read
+            _shapes_backend = ("numpy" if getattr(i3d_shapes_reader, "USE_NUMPY", False)
+                               and getattr(i3d_shapes_reader, "_np", None) is not None
+                               else "python")
+            _report('INFO',
+                    f"Shapes binary decrypted+read ({_shapes_backend}) in {_read_secs:.2f}s")
 
             num_shape_entities = 0
             num_spline_entities = 0
@@ -418,6 +426,7 @@ def import_i3d(i3d_filepath: str, report: Callable = None,
                 obj.select_set(False)
         bpy.context.view_layer.objects.active = None
 
+        _total_secs = time.perf_counter() - _t_import_start
         _report('INFO',
                 f"Import done: {counts['shapes_imported']} shapes, "
                 f"{counts['empties']} empties, "
@@ -426,7 +435,8 @@ def import_i3d(i3d_filepath: str, report: Callable = None,
                 f"{counts['splines']} splines, "
                 f"{counts['hidden']} hidden, "
                 f"{counts['shapes_missing_objx']} shapes without .objx, "
-                f"{len(material_cache)} material(s), {len(image_cache)} image(s) loaded")
+                f"{len(material_cache)} material(s), {len(image_cache)} image(s) loaded "
+                f"in {_total_secs:.2f} seconds")
 
         # Warn about mod-local custom maps that won't survive re-export unless
         # the .blend is saved in the mod folder (GitHub #41).
@@ -735,14 +745,19 @@ def _build_mesh_datablock(shape, datablock_name, node, scene, material_cache,
     md = i3d_shapes_to_meshdata.shape_to_mesh_data(shape, name=datablock_name)
 
     mesh = bpy.data.meshes.new(name=datablock_name)
-    face_v_indices = [tuple(idx[0] for idx in face) for face in md.faces]
+    face_v_indices = [(f[0][0], f[1][0], f[2][0]) for f in md.faces]
     # Pre-scan for degenerate faces so we can log at the right level.
     # Duplicate verts (zero-area faces) are common in source files and
     # expected; out-of-range indices indicate a real decoder problem.
+    # Faces are triangles, so plain comparisons replace the per-face set()/any().
     _nv = len(md.vertices)
-    _dup = sum(1 for fv in face_v_indices if len(set(fv)) < len(fv))
-    _oor = sum(1 for fv in face_v_indices
-               if len(set(fv)) == len(fv) and any(i < 0 or i >= _nv for i in fv))
+    _dup = 0
+    _oor = 0
+    for _a, _b, _c in face_v_indices:
+        if _a == _b or _b == _c or _a == _c:
+            _dup += 1
+        elif not (0 <= _a < _nv and 0 <= _b < _nv and 0 <= _c < _nv):
+            _oor += 1
     if _dup:
         report('INFO', f"Mesh '{datablock_name}': {_dup} zero-area face(s) removed "
                         f"(degenerate triangles in source file, normal behaviour).")
@@ -755,28 +770,34 @@ def _build_mesh_datablock(shape, datablock_name, node, scene, material_cache,
     # UV1
     if md.uvs and md.faces:
         uv_layer = mesh.uv_layers.new(name="UVMap")
+        _flat = [0.0] * (2 * len(mesh.loops))
         loop_idx = 0
         for face in md.faces:
             for vert_ref in face:
                 uv_idx = vert_ref[1]
                 if uv_idx is not None and 0 <= uv_idx < len(md.uvs):
                     u, v = md.uvs[uv_idx]
-                    uv_layer.data[loop_idx].uv = (u, v)
+                    _flat[2 * loop_idx] = u
+                    _flat[2 * loop_idx + 1] = v
                 loop_idx += 1
+        uv_layer.data.foreach_set('uv', _flat)
 
     # Multi-UV - UV2/UV3/UV4. The index in the f line is the same as for UV1.
     for uvs_n, layer_name in ((md.uvs2, "UV2"), (md.uvs3, "UV3"), (md.uvs4, "UV4")):
         if not uvs_n or not md.faces:
             continue
         uv_layer = mesh.uv_layers.new(name=layer_name)
+        _flat = [0.0] * (2 * len(mesh.loops))
         loop_idx = 0
         for face in md.faces:
             for vert_ref in face:
                 uv_idx = vert_ref[1]
                 if uv_idx is not None and 0 <= uv_idx < len(uvs_n):
                     u, v = uvs_n[uv_idx]
-                    uv_layer.data[loop_idx].uv = (u, v)
+                    _flat[2 * loop_idx] = u
+                    _flat[2 * loop_idx + 1] = v
                 loop_idx += 1
+        uv_layer.data.foreach_set('uv', _flat)
 
     # Vertex colors as a color attribute on CORNER domain.
     # CORNER (= per loop / face-corner), not POINT - that's what the Giants
@@ -786,13 +807,19 @@ def _build_mesh_datablock(shape, datablock_name, node, scene, material_cache,
         color_layer = mesh.color_attributes.new(
             name="Color", type='FLOAT_COLOR', domain='CORNER'
         )
+        _flat = [0.0] * (4 * len(mesh.loops))
         loop_idx = 0
         for face in md.faces:
             for vert_ref in face:
                 v_idx = vert_ref[0]
                 if v_idx is not None and 0 <= v_idx < len(md.vertex_colors):
-                    color_layer.data[loop_idx].color = md.vertex_colors[v_idx]
+                    _c = md.vertex_colors[v_idx]
+                    _flat[4 * loop_idx] = _c[0]
+                    _flat[4 * loop_idx + 1] = _c[1]
+                    _flat[4 * loop_idx + 2] = _c[2]
+                    _flat[4 * loop_idx + 3] = _c[3]
                 loop_idx += 1
+        color_layer.data.foreach_set('color', _flat)
 
     # Material slots: one slot per materialId from the XML node. Carry the
     # per-subset material slot name (read from the .i3d.shapes binary) onto the
@@ -3170,8 +3197,13 @@ def _process_merge_groups(import_collection, shape_map, shape_id_to_obj, report)
                      for i in slot_vert_indices]
             mdb = _bpy.data.meshes.new(name=name)
             _nv = len(verts)
-            _dup = sum(1 for fv in slot_tri_locals if len(set(fv)) < len(fv))
-            _oor = sum(1 for fv in slot_tri_locals if len(set(fv)) == len(fv) and any(i < 0 or i >= _nv for i in fv))
+            _dup = 0
+            _oor = 0
+            for _a, _b, _c in slot_tri_locals:
+                if _a == _b or _b == _c or _a == _c:
+                    _dup += 1
+                elif not (0 <= _a < _nv and 0 <= _b < _nv and 0 <= _c < _nv):
+                    _oor += 1
             if _dup:
                 report('INFO', f"Merge-group slot mesh '{name}': {_dup} zero-area face(s) removed "
                                 f"(degenerate triangles in source file, normal behaviour).")
@@ -3201,30 +3233,33 @@ def _process_merge_groups(import_collection, shape_map, shape_id_to_obj, report)
 
             # ---- UV channels (0..3) ----
             uv_layer_names = ("UVMap", "UV2", "UV3", "UV4")
+            _nl = len(mdb.loops)
+            _loop_vs = [0] * _nl
+            mdb.loops.foreach_get('vertex_index', _loop_vs)
             for uv_ch, uv_set in enumerate(shape.uv_sets):
                 if uv_set is None:
                     continue
                 uv_layer = mdb.uv_layers.new(name=uv_layer_names[uv_ch])
-                for poly in mdb.polygons:
-                    for loop_idx in poly.loop_indices:
-                        loop = mdb.loops[loop_idx]
-                        local_v = loop.vertex_index
-                        global_v = slot_vert_indices[local_v]
-                        uv = uv_set[global_v]
-                        uv_layer.data[loop_idx].uv = (uv.u, uv.v)
+                _flat = [0.0] * (2 * _nl)
+                for _i, _local_v in enumerate(_loop_vs):
+                    _uv = uv_set[slot_vert_indices[_local_v]]
+                    _flat[2 * _i] = _uv.u
+                    _flat[2 * _i + 1] = _uv.v
+                uv_layer.data.foreach_set('uv', _flat)
 
             # ---- Vertex colors (CORNER domain, per loop, like _build_mesh_datablock) ----
             if shape.vertex_colors is not None:
                 color_layer = mdb.color_attributes.new(
                     name="Color", type='FLOAT_COLOR', domain='CORNER'
                 )
-                for poly in mdb.polygons:
-                    for loop_idx in poly.loop_indices:
-                        loop = mdb.loops[loop_idx]
-                        local_v = loop.vertex_index
-                        global_v = slot_vert_indices[local_v]
-                        c = shape.vertex_colors[global_v]
-                        color_layer.data[loop_idx].color = (c.x, c.y, c.z, c.w)
+                _cflat = [0.0] * (4 * _nl)
+                for _i, _local_v in enumerate(_loop_vs):
+                    _c = shape.vertex_colors[slot_vert_indices[_local_v]]
+                    _cflat[4 * _i] = _c.x
+                    _cflat[4 * _i + 1] = _c.y
+                    _cflat[4 * _i + 2] = _c.z
+                    _cflat[4 * _i + 3] = _c.w
+                color_layer.data.foreach_set('color', _cflat)
 
             # validate() after material/UV/color setup (removes degenerate
             # geometry) and BEFORE custom normals (needs a clean mesh).
@@ -3490,10 +3525,10 @@ def _process_skin_bindings(import_collection, report):
                 resolved_names.append(bound.name)
 
         mesh_obj['_i3d_skinBindObjects'] = ', '.join(resolved_names)
-        report('INFO',
-               f"{mesh_obj.name}: skinBindNodeIds {bind_ids} -> "
-               f"_i3d_skinBindObjects={resolved_names} "
-               f"(info only; re-export fidelity requires armature setup v3)")
+        # report('INFO',
+        #        f"{mesh_obj.name}: skinBindNodeIds {bind_ids} -> "
+        #        f"_i3d_skinBindObjects={resolved_names} "
+        #        f"(info only; re-export fidelity requires armature setup v3)")
 
         # Clean up intermediate property
         del mesh_obj['_i3d_skinBindNodeIds_raw']
@@ -3720,16 +3755,17 @@ def _post_import_view_setup(import_collection, report, frame_view=True):
                             bpy.ops.view3d.view_selected()
                         framed += 1
                     except Exception as e:
-                        report('INFO',
-                               f"view_selected skipped for one viewport: {e}")
+                        # report('INFO',
+                        #        f"view_selected skipped for one viewport: {e}")
+                        pass
                     break
 
     if need_clip_bump:
         report('INFO',
                "Large imported object detected (>500 units) - bumped "
                "3D Viewport clip-end to 10000 in all View3D areas.")
-    if framed:
-        report('INFO', f"Framed imported objects in {framed} viewport(s).")
+    # if framed:
+    #     report('INFO', f"Framed imported objects in {framed} viewport(s).")
 
 
 def _force_empty_visibility_on_all_views(report):

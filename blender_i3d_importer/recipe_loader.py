@@ -879,6 +879,172 @@ def _get_detail_diffuse_atlas(i3d_dir, resolve_filepath, report):
     return (img, rows)
 
 
+# ---------------------------------------------------------------------------
+# Material template cache: build ONE debug material per topology signature,
+# copy + value-swap the rest. Verified byte-identical to the from-scratch
+# build via the both-ways harness (puma / fh16 / farmersMarket, 0 diffs).
+# Toggle off to force the pure from-scratch path (parity testing).
+# ---------------------------------------------------------------------------
+
+USE_MATERIAL_TEMPLATES = True
+_TEMPLATE_CACHE = {}          # signature -> template bpy.types.Material
+_TEMPLATE_CACHE_UUID = None   # per-import; reset when the import UUID changes
+
+
+def _material_template_signature(a):
+    """Topology signature: same signature => identical node-graph structure.
+
+    Verified across puma / fh16 / farmersMarket (0 signatures spanning >1
+    topology). Conservative (over-partitions) but never merges materials that
+    would build different graphs. specularColor presence matters (drives the
+    fs25_const_ao branch).
+    """
+    cms = tuple(sorted(cm.get('name') for cm in a.get('_custommaps', [])))
+    cps = tuple(sorted(cp.get('name') for cp in a.get('_customparameters', [])))
+    # diffuseColor alpha < 1 triggers BLEND + an Alpha default in build_pbr; keep
+    # it in the signature so blend_method stays constant within a template group.
+    _diffuse = a.get('diffuseColor')
+    _alpha_lt1 = False
+    if _diffuse:
+        try:
+            _alpha_lt1 = float(str(_diffuse).split()[3]) < 1.0
+        except (IndexError, ValueError):
+            _alpha_lt1 = False
+    return (a.get('customShaderId'), a.get('customShaderVariation'),
+            a.get('alphaBlending'),
+            '_texture_fileId' in a, '_normalmap_fileId' in a, '_glossmap_fileId' in a,
+            cms, cps, 'specularColor' in a, _alpha_lt1)
+
+
+def _templating_allowed(a):
+    """colorMat palette maps (FS22 vehicleShader colorMat0..7) are not yet
+    reproduced by the value-swap, so such materials are always built from
+    scratch (correctness over the marginal speedup)."""
+    for cp in a.get('_customparameters', []):
+        if str(cp.get('name', '')).startswith('colorMat'):
+            return False
+    return True
+
+
+def _reset_material_template_cache():
+    global _TEMPLATE_CACHE_UUID
+    from . import importer as _imp
+    uuid = _imp._CURRENT_IMPORT_UUID
+    if uuid != _TEMPLATE_CACHE_UUID:
+        _TEMPLATE_CACHE.clear()
+        _TEMPLATE_CACHE_UUID = uuid
+
+
+def _swap_per_material_values(mat, a, mat_name, scene, i3d_dir,
+                              resolve_filepath, image_loader, image_cache, report):
+    """Reapply per-material values onto a template-copied debug material.
+
+    Touches only what varies within a template signature (verified via the
+    both-ways harness): image datablocks, fs25_param:* value nodes,
+    debug-mask props, material id + name. Structure/wiring come from the copy.
+    """
+    nt = mat.node_tree
+
+    def _img(fid):
+        if fid is None:
+            return None
+        try:
+            path = scene.files.get(int(fid))
+        except (TypeError, ValueError):
+            return None
+        if not path:
+            return None
+        resolved = resolve_filepath(path, i3d_dir)
+        return image_loader(resolved, image_cache, report) if resolved else None
+
+    by_name = {n.name: n for n in nt.nodes}
+    by_label = {}
+    for n in nt.nodes:
+        by_label.setdefault(n.label, []).append(n)
+
+    def _set_image(label, fid):
+        img = _img(fid)
+        for n in by_label.get(label, []):
+            if n.type == 'TEX_IMAGE':
+                n.image = img
+
+    _set_image('baseMap', a.get('_texture_fileId'))
+    _set_image('glossMap', a.get('_glossmap_fileId'))
+    _set_image('normalMap', a.get('_normalmap_fileId'))
+
+    first_cm_image = None
+    debug_mask_images = {}
+    for cm in a.get('_custommaps', []):
+        cm_name = cm.get('name')
+        img = _img(cm.get('fileId'))
+        if first_cm_image is None:
+            first_cm_image = img
+        if img is not None:
+            debug_mask_images[cm_name] = img.name
+        for n in by_label.get(cm_name, []):
+            if n.type == 'TEX_IMAGE':
+                n.image = img
+
+    mask_node = by_name.get('fs25_debug:mask_image')
+    if mask_node is not None and mask_node.type == 'TEX_IMAGE':
+        mask_node.image = first_cm_image
+
+    params = {cp.get('name'): cp.get('value')
+              for cp in a.get('_customparameters', [])}
+    for n in nt.nodes:
+        if not n.name.startswith('fs25_param:'):
+            continue
+        raw = params.get(n.get('fs25_xml_param'))
+        if raw is None:
+            continue
+        try:
+            parts = [float(x) for x in str(raw).split()]
+        except ValueError:
+            continue
+        if not parts:
+            continue
+        if n.get('fs25_serialize') == 'rgba':
+            if len(parts) == 3:
+                n.outputs[0].default_value = (parts[0], parts[1], parts[2], 1.0)
+            elif len(parts) >= 4:
+                n.outputs[0].default_value = tuple(parts[:4])
+        else:
+            idx = {'all': 0, 'x': 0, 'y': 1, 'z': 2, 'w': 3,
+                   'rgb': 0, 'alpha': 3}.get(n.get('fs25_xml_slot'), 0)
+            if idx < len(parts):
+                n.outputs[0].default_value = float(parts[idx])
+
+    # Diffuse color -> BSDF Base Color (+ Alpha). For textured materials Base
+    # Color is linked (this default is overridden); for textureless materials it
+    # varies within a signature and must be swapped. Mirrors build_pbr's block 2.
+    _diffuse = a.get('diffuseColor')
+    if _diffuse:
+        _bsdf = next((n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+        if _bsdf is not None:
+            _rgba = _parse_vec4(_diffuse, default=(1.0, 1.0, 1.0, 1.0))
+            _bsdf.inputs['Base Color'].default_value = _rgba
+            if _rgba[3] < 1.0 and 'Alpha' in _bsdf.inputs:
+                _bsdf.inputs['Alpha'].default_value = _rgba[3]
+
+    try:
+        mat['_i3d_material_id'] = int(a.get('materialId', 0))
+    except (TypeError, ValueError):
+        mat['_i3d_material_id'] = 0
+    mat['_i3d_debug_pbr_for'] = mat_name
+    mat['_fs25_debug_mask_images'] = debug_mask_images
+    mat['_fs25_debug_masks'] = list(debug_mask_images.keys())
+
+    mat_id = a.get('materialId', '')
+    debug_name = (f"{mat_name}_pbr_debug_{mat_id}" if mat_id
+                  else f"{mat_name}_pbr_debug")
+    existing = bpy.data.materials.get(debug_name)
+    if existing is not None and existing != mat:
+        bpy.data.materials.remove(existing)
+    mat.name = debug_name
+    return mat
+
+
+
 def build_pbr_debug_material(
     mat_name: str,
     mat_attrs: dict,
@@ -903,6 +1069,19 @@ def build_pbr_debug_material(
     Returns:
         bpy.types.Material - finished debug material (always non-None).
     """
+    # Fast path: reuse a per-signature template built earlier this import and
+    # only swap the per-material values. Verified byte-identical to the
+    # from-scratch build below (both-ways harness).
+    if USE_MATERIAL_TEMPLATES and _templating_allowed(mat_attrs):
+        _reset_material_template_cache()
+        _sig = _material_template_signature(mat_attrs)
+        _tmpl = _TEMPLATE_CACHE.get(_sig)
+        if _tmpl is not None and _tmpl.name in bpy.data.materials:
+            _copy = _tmpl.copy()
+            return _swap_per_material_values(
+                _copy, mat_attrs, mat_name, scene, i3d_dir,
+                resolve_filepath, image_loader, image_cache, report)
+
     # Naming: <mat_name>_pbr_debug_<materialId>
     # Disambig via materialId, because multiple i3d materials can share the
     # same name (cube2.i3d has 4x "UnnamedMaterial"). Reimports of an i3d ->
@@ -2535,20 +2714,24 @@ def build_pbr_debug_material(
     # far right, frame the debug nodes.
     _finalize_layout(mat, bsdf, output_node)
 
-    # Status-Log
-    if cm_count > 0:
-        variation = mat_attrs.get('customShaderVariation', '') or '(none)'
-        if composited_features:
-            features_str = ', '.join(composited_features)
-            report('INFO',
-                   f"PBR debug '{mat_name}': {cm_count} custom map(s), variation "
-                   f"'{variation}' - composited: {features_str}")
-        else:
-            report('INFO',
-                   f"PBR debug '{mat_name}': {cm_count} custom map(s), variation "
-                   f"'{variation}' - no compositing rule applied "
-                   f"(custom maps: {sorted(cm_tex.keys())}). Wire manually.")
+    # Status-Log (per-material PBR debug summary muted to declutter the info panel)
+    # if cm_count > 0:
+    #     variation = mat_attrs.get('customShaderVariation', '') or '(none)'
+    #     if composited_features:
+    #         features_str = ', '.join(composited_features)
+    #         report('INFO',
+    #                f"PBR debug '{mat_name}': {cm_count} custom map(s), variation "
+    #                f"'{variation}' - composited: {features_str}")
+    #     else:
+    #         report('INFO',
+    #                f"PBR debug '{mat_name}': {cm_count} custom map(s), variation "
+    #                f"'{variation}' - no compositing rule applied "
+    #                f"(custom maps: {sorted(cm_tex.keys())}). Wire manually.")
 
+    # Cache this fully-built material as the template for its signature so the
+    # remaining same-signature materials can be copied + value-swapped.
+    if USE_MATERIAL_TEMPLATES and _templating_allowed(mat_attrs):
+        _TEMPLATE_CACHE[_material_template_signature(mat_attrs)] = mat
     return mat
 
 
