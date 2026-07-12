@@ -24,7 +24,7 @@ import xml.etree.ElementTree as ET
 import bpy
 import mathutils
 
-from . import i3d_reference_loader, i3d_wheel_resolver
+from . import i3d_config_preview, i3d_reference_loader, i3d_wheel_resolver
 
 INCH = 0.0254
 
@@ -318,8 +318,12 @@ def _registry_from_existing(import_id):
         if o.get("_i3d_wheel_import") != import_id:
             continue
         for ms in o.material_slots:
-            m = ms.material
-            if m and "_pbr_debug" in m.name:
+            # the slot may hold the EXPORT material (ATTACH_DEBUG_MATERIALS_TO_
+            # MESH off) - resolve to the pair's debug material, otherwise the
+            # registry stays empty and every newly loaded wheel part builds
+            # duplicate debug datablocks (..._pbr_debug.001/.002)
+            m = i3d_config_preview.debug_pair(ms.material)
+            if m is not None:
                 base = m.get("_i3d_debug_base") or m.name
                 reg.setdefault(base, m)
     return reg
@@ -940,5 +944,11 @@ def load_all_wheels(vehicle_xml_path, data_dir, import_id, config_index=0,
 
     bpy.context.view_layer.update()
     _purge_empty_ref_collections()
+    # Baked rims/connectors inherit their materials from the frozen pre-bake mesh
+    # (import-time state), so re-assert the scene's material mode on everything
+    # this import owns - otherwise a bake after a switch to debug brings the
+    # export material back (white rims / connectors).
+    i3d_reference_loader.apply_material_mode(
+        [o for o in bpy.data.objects if o.get("_i3d_wheel_import") == import_id])
     _restore_selection(prev_sel, prev_act)
     return len(needed)

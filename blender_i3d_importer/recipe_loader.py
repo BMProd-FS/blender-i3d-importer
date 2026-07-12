@@ -1030,7 +1030,6 @@ def _swap_per_material_values(mat, a, mat_name, scene, i3d_dir,
         mat['_i3d_material_id'] = int(a.get('materialId', 0))
     except (TypeError, ValueError):
         mat['_i3d_material_id'] = 0
-    mat['_i3d_debug_pbr_for'] = mat_name
     mat['_fs25_debug_mask_images'] = debug_mask_images
     mat['_fs25_debug_masks'] = list(debug_mask_images.keys())
 
@@ -1108,8 +1107,6 @@ def build_pbr_debug_material(
     except (ValueError, TypeError):
         mat['_i3d_material_id'] = 0
     mat['_i3d_material_kind'] = 'debug'
-    mat['_i3d_debug_pbr_for'] = mat_name
-    mat['_i3d_debug_pbr_variation'] = mat_attrs.get('customShaderVariation', '') or ''
     # Stamp the current import's UUID so the switch operator can pair this
     # debug material with its export counterpart from the same import even
     # when multiple imports share material_id 0/1/2/...
@@ -2408,11 +2405,10 @@ def build_pbr_debug_material(
             composited_features.append('Snow')
 
             # SnowIntensity slider. Default reads from i3d snowScale custom
-            # parameter when present, else 0.0 (no snow visible). The raw
-            # value is also stored as custom property for re-export fidelity.
+            # parameter when present, else 0.0 (no snow visible). The raw value
+            # is NOT mirrored onto the debug material - re-export reads it from
+            # the export material's customParameter_snowScale.
             sn_scale_raw = custom_params.get('snowScale')
-            if sn_scale_raw is not None:
-                mat['_i3d_pbr_snowScale'] = str(sn_scale_raw)
             try:
                 sn_intensity = float(str(sn_scale_raw).split()[0]) \
                                if sn_scale_raw is not None else 0.0
@@ -2554,7 +2550,6 @@ def build_pbr_debug_material(
                             target_input=ml,
                             xml_param="contrastLuminiosity", xml_slot="y",
                         )
-                mat['_i3d_pbr_contrastLuminiosity'] = str(cl)
 
             # BaseColor Input
             nt.links.new(base_color_source, mt_grp.inputs['BaseColor'])

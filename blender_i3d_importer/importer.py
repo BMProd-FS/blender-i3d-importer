@@ -22,7 +22,7 @@ import re
 import time
 import uuid
 from pathlib import Path
-from typing import Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import bpy
 
@@ -52,6 +52,19 @@ ATTACH_DEBUG_MATERIALS_TO_MESH = False
 # Snippet cache: cleared per import (in import_i3d). Module variable instead
 # of function parameter to avoid massive plumbing through 5 functions.
 _snippet_cache: Dict[str, Optional["bpy.types.NodeTree"]] = {}
+
+# Material pairs of the CURRENT import: material_id -> the material of the pair
+# that is NOT put into the mesh slot (see the end of _build_material).
+# The per-subset materialSlotName is only known at mesh-build time, but it must
+# land on BOTH materials of a pair: the EXPORT material (the Giants exporter
+# reads it back on re-export) and the DEBUG material (the store-config colour
+# preview matches its target slots against it, i3d_config_preview.
+# _import_materials_by_slot). Which of the two sits in the mesh slot depends on
+# ATTACH_DEBUG_MATERIALS_TO_MESH, so stamping only the attached one silently
+# broke the other side - with the default (False) the colour swatches of a
+# placeable/vehicle config were a no-op because no debug material ever carried
+# a slot name. Cleared per import, like _snippet_cache.
+_material_pairs: Dict[int, Any] = {}
 
 # Per-import UUID. Set at the start of every import_i3d() call. Both the
 # re-export material in _build_material() and the debug material in
@@ -136,6 +149,7 @@ def import_i3d(i3d_filepath: str, report: Callable = None,
 
     # Reset snippet cache per import
     _snippet_cache.clear()
+    _material_pairs.clear()
 
     # New UUID per import - stamped on every material pair (export + debug)
     # so the N-Panel "Switch i3d Materials" operator can disambiguate pairs
@@ -831,6 +845,10 @@ def _build_mesh_datablock(shape, datablock_name, node, scene, material_cache,
     # the engine's MaterialUtil.getMaterialBySlotName can no longer find it.
     # The name lives on the shared material datablock, so merge-child sub-meshes
     # (which reuse these materials) inherit it automatically.
+    # It is stamped on BOTH materials of the pair (mesh-slot material AND its
+    # counterpart from _material_pairs): the exporter needs it on the export
+    # material, the store-config colour preview needs it on the debug material,
+    # and which of them is in the slot depends on ATTACH_DEBUG_MATERIALS_TO_MESH.
     _slot_names = getattr(shape, 'material_slot_names', None) or []
     for _slot_idx, mat_id in enumerate(node.materialIds):
         mat = _get_or_create_material(
@@ -840,6 +858,9 @@ def _build_mesh_datablock(shape, datablock_name, node, scene, material_cache,
             _sname = _slot_names[_slot_idx]
             if _sname:
                 mat['materialSlotName'] = _sname
+                _pair = _material_pairs.get(mat_id)
+                if _pair is not None:
+                    _pair['materialSlotName'] = _sname
         mesh.materials.append(mat)
 
     # Set polygon.material_index per face.
@@ -1528,14 +1549,6 @@ def _create_terrain_object(node, scene, i3d_dir, terrain_lod,
         node, scene.files, i3d_dir, image_cache, report,
         selected_names=poc_combined_layer_names,
     )
-    # Inspection-Property: wie viele Bilder konnten aufgeloest werden?
-    # Sichtbar im Object-Properties-Panel als Custom Property.
-    obj['_i3d_terrain_poc_image_count'] = sum(
-        sum(1 for k in ('detail_image', 'weight_image')
-            if sl[k] is not None)
-        for cl in terrain_layer_plan for sl in cl['sub_layers']
-    )
-
     # Sub-3.3: NodeGroup pro CombinedLayer bauen (worldspace-triplanar).
     # Die NodeGroups sind unter Add -> Group im Shader-Editor verfuegbar.
     # Verbindung ans Material folgt in Sub-3.4.
@@ -1552,7 +1565,6 @@ def _create_terrain_object(node, scene, i3d_dir, terrain_lod,
         report('INFO',
                f"Terrain '{obj.name}': {len(poc_node_group_names)} NodeGroup(s) built: "
                f"{', '.join(poc_node_group_names)}")
-    obj['_i3d_terrain_poc_node_groups'] = ', '.join(poc_node_group_names)
 
     # Sub-3.4 + 3.5: Master-Material bauen und an Terrain-Mesh anhaengen.
     # Verschaltet die CombinedLayer-NodeGroups via weightMap-Mixing-Stack.
@@ -1951,7 +1963,6 @@ def _build_material(material_id, scene, image_cache, shader_cache, i3d_dir, repo
     # material renames by the user.
     mat['_i3d_material_id'] = material_id
     mat['_i3d_material_kind'] = 'export'
-    mat['_i3d_materialId'] = material_id  # legacy, kept for backward compat
     if _CURRENT_IMPORT_UUID is not None:
         mat['_i3d_import_uuid'] = _CURRENT_IMPORT_UUID
 
@@ -2132,10 +2143,15 @@ def _build_material(material_id, scene, image_cache, shader_cache, i3d_dir, repo
     # when ATTACH_DEBUG_MATERIALS_TO_MESH is set, swap the returned
     # material (debug to the mesh). The re-export material gets fake_user for
     # later manual swapping.
+    # Either way, remember the counterpart that does NOT go into the mesh slot,
+    # so _build_mesh_datablock can stamp materialSlotName on both (_material_pairs).
     if ATTACH_DEBUG_MATERIALS_TO_MESH and debug_mat is not None:
         mat.use_fake_user = True
+        _material_pairs[material_id] = mat
         return debug_mat
 
+    if debug_mat is not None:
+        _material_pairs[material_id] = debug_mat
     return mat
 
 
@@ -3466,25 +3482,20 @@ def _process_merge_groups(import_collection, shape_map, shape_id_to_obj, report)
 # ---------------------------------------------------------------------------
 
 def _process_skin_bindings(import_collection, report):
-    """skinBindNodeIds-processing (only research).
+    """Clean up the intermediate _i3d_skinBindNodeIds_raw property.
 
     HISTORY:
     - v1 (mergeGroup path): failed on re-export because mergeGroup members
       expect mesh data, but our "Bones" are TransformGroups
       (dccBlender.py:446: `item["Vertices"]['data']` → None).
-    - v2 (now): no mergeGroup setup. We park only _i3d_skinBindObjects
-      with resolved object names as info. Non re-export true (without
-      skinBindNodeIds in the XML).
-    - v3 (planned): full Armature-Setup with Bones + Vertex-Groups + Weights +
-      ARMATURE modifier. May need another i3d-to-objx patch for blendweights.
+    - v2: no mergeGroup setup; the resolved bind objects were only parked as
+      an info IDProperty (_i3d_skinBindObjects) - never read by anything.
+    - v3 (current, GitHub #37): the real skin setup runs in the shared
+      'zzz_armature' pass (bones + vertex groups + weights + ARMATURE
+      modifier), driven by the binary is_armature_skin flag. This function is
+      therefore only the cleanup pass for the raw property that the armature
+      pass has already consumed.
     """
-    # Lookup: nodeId -> object (for resolving skinBindNodeIds)
-    node_id_to_obj = {}
-    for obj in import_collection.objects:
-        nid = obj.get('_i3d_nodeId')
-        if nid is not None:
-            node_id_to_obj[int(nid)] = obj
-
     # Collect all meshes with skinBindNodeIds_raw
     skin_meshes = [obj for obj in import_collection.objects
                    if '_i3d_skinBindNodeIds_raw' in obj.keys()]
@@ -3514,23 +3525,7 @@ def _process_skin_bindings(import_collection, report):
             del mesh_obj['_i3d_skinBindNodeIds_raw']
             continue
 
-        # v2 (no mergeGroup): save Object-Refs only as Info.
-        # No i3D_mergeGroup-Setup anymore (Re-Export broken).
-        resolved_names = []
-        for bind_id in bind_ids:
-            bound = node_id_to_obj.get(bind_id)
-            if bound is None:
-                resolved_names.append(f'<nodeId={bind_id} not found>')
-            else:
-                resolved_names.append(bound.name)
-
-        mesh_obj['_i3d_skinBindObjects'] = ', '.join(resolved_names)
-        # report('INFO',
-        #        f"{mesh_obj.name}: skinBindNodeIds {bind_ids} -> "
-        #        f"_i3d_skinBindObjects={resolved_names} "
-        #        f"(info only; re-export fidelity requires armature setup v3)")
-
-        # Clean up intermediate property
+        # Clean up intermediate property (consumed by the armature pass)
         del mesh_obj['_i3d_skinBindNodeIds_raw']
 
 

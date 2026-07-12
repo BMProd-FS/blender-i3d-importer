@@ -409,6 +409,17 @@ class IMPORT_OT_fs25_i3d(Operator, ImportHelper):
 
         try:
             _before = set(bpy.data.objects)
+            # Seed the scene's sticky material mode from THIS import's dialog
+            # options (which invoke() pre-fills from the preferences, but the
+            # user can change them per import). Set BEFORE the import so anything
+            # the import itself pulls in already follows this choice. Parts loaded
+            # later (wheels, referenced i3ds) read it, and every scene-wide switch
+            # in the N-Panel overwrites it.
+            i3d_reference_loader.set_material_mode(
+                context.scene,
+                'debug' if (self.build_pbr_debug_materials
+                            and self.attach_debug_materials_to_mesh)
+                else 'export')
             count, warnings = importer.import_i3d(
                 self.filepath, report=self.report,
                 apply_axis_correction=self.apply_axis_correction,
@@ -549,6 +560,14 @@ class FS25_OT_switch_materials(Operator):
                     continue
                 slot.material = pair
                 swapped += 1
+
+        # A scene-wide switch is the user's choice for the WHOLE scene, so it
+        # becomes the mode that later imports (wheels, referenced i3ds) follow.
+        # A selection-limited switch says nothing about the scene and is not
+        # recorded. 'toggle' has no single resulting kind - the N-Panel buttons
+        # always pass an explicit kind.
+        if self.scope == 'all_imported' and self.target_kind in ('debug', 'export'):
+            i3d_reference_loader.set_material_mode(context.scene, self.target_kind)
 
         self.report({'INFO'}, f"Material switch: {swapped} swapped, {skipped} skipped")
         return {'FINISHED'}

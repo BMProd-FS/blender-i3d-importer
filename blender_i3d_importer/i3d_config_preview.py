@@ -51,17 +51,57 @@ def _vec3(s):
     return vals
 
 
+def _material_pair(mat, kind):
+    """The material of *mat*'s import pair with the given ``kind``
+    ('debug' / 'export'), matched on (_i3d_material_id, _i3d_import_uuid).
+    Returns *mat* itself when it already has that kind, None when the
+    counterpart does not exist.
+    """
+    if mat is None:
+        return None
+    if mat.get("_i3d_material_kind") == kind:
+        return mat
+    mid = mat.get("_i3d_material_id")
+    uuid = mat.get("_i3d_import_uuid")
+    if mid is None:
+        return None
+    for m in bpy.data.materials:
+        if (m.get("_i3d_material_kind") == kind
+                and m.get("_i3d_material_id") == mid
+                and m.get("_i3d_import_uuid") == uuid):
+            return m
+    return None
+
+
+def debug_pair(mat):
+    """The DEBUG material of *mat*'s pair.
+
+    ALL preview state (config colours, material templates, shader params) lives
+    on the debug material - it is the only one carrying fs25_param:* nodes. The
+    export material is never touched by the preview; changes reach it solely via
+    the Sync button, which keeps a re-export byte-identical to the source until
+    the user deliberately pushes something across.
+
+    Which of the two sits in a mesh slot depends on the
+    ATTACH_DEBUG_MATERIALS_TO_MESH preference, so every preview pass resolves
+    the slot material to its debug counterpart instead of assuming the debug
+    material is the attached one (that assumption silently disabled the whole
+    colour picker when the preference was off).
+    """
+    return _material_pair(mat, "debug")
+
+
 def _set_shader_param(obj, param_name, value_str):
     """Best-effort: set the fs25_param node(s) for *param_name* on the object's
     debug materials from a vec4 string. Skips silently when the param has no node
-    (re-export material, or a shader param that is not a CustomParameter).
+    (a shader param that is not a CustomParameter).
     """
     vals = [float(x) for x in value_str.replace(",", " ").split()]
     while len(vals) < 4:
         vals.append(0.0)
     slot_idx = {"x": 0, "y": 1, "z": 2, "w": 3, "alpha": 3}
     for ms in obj.material_slots:
-        mat = ms.material
+        mat = debug_pair(ms.material)
         if mat is None or not mat.use_nodes:
             continue
         for n in mat.node_tree.nodes:
@@ -294,7 +334,9 @@ def _import_materials_by_slot(import_id):
                 and o.get("_i3d_wheel_import") != import_id):
             continue
         for ms in o.material_slots:
-            mat = ms.material
+            # the slot may hold the export material (ATTACH_DEBUG_MATERIALS_TO_
+            # MESH off) - the preview always targets the pair's debug material
+            mat = debug_pair(ms.material)
             if mat is None or mat.name in seen:
                 continue
             seen.add(mat.name)
@@ -398,8 +440,16 @@ def _set_mat_param(mat, param, value_str):
 
 
 def _capture_orig(mat):
-    """Snapshot a material's current fs25_param values once (for restore)."""
+    """Snapshot a material's current fs25_param values once (for restore).
+
+    Materials without any fs25_param node (i.e. export materials, which the
+    preview never touches) are skipped entirely - snapshotting them wrote three
+    empty ``{}`` IDProperties onto every export material and, worse, the
+    once-only semantics below then blocked a later real capture.
+    """
     if mat.get("_i3d_cfg_orig") is not None or not mat.use_nodes:
+        return
+    if not any(n.name.startswith("fs25_param:") for n in mat.node_tree.nodes):
         return
     orig = {}
     # Two passes, RGB nodes first: an RGB and a scalar node can share one
@@ -817,7 +867,7 @@ def _rim_materials(import_id):
         if o.get("_i3d_wheel_import") != import_id:
             continue
         for ms in o.material_slots:
-            m = ms.material
+            m = debug_pair(ms.material)      # slot may hold the export material
             if m is None or m.name in seen:
                 continue
             seen.add(m.name)
@@ -832,19 +882,14 @@ def rim_color_label(template_name, data_base):
     return t.get("title") or template_name
 
 
-def _export_pair(debug_mat):
-    """The re-export material paired with *debug_mat* (same _i3d_material_id +
-    _i3d_import_uuid, kind 'export'), or None."""
-    mid = debug_mat.get("_i3d_material_id")
-    uuid = debug_mat.get("_i3d_import_uuid")
-    if mid is None:
-        return None
-    for m in bpy.data.materials:
-        if (m.get("_i3d_material_kind") == "export"
-                and m.get("_i3d_material_id") == mid
-                and m.get("_i3d_import_uuid") == uuid):
-            return m
-    return None
+def _export_pair(mat):
+    """The re-export material paired with *mat* (same _i3d_material_id +
+    _i3d_import_uuid, kind 'export'), or None.
+
+    Handed an export material it returns that material - callers pass the debug
+    material, but the identity case keeps the old accidental self-match honest.
+    """
+    return _material_pair(mat, "export")
 
 
 def _set_export_colorscale(exp_mat, colorscale_str):
