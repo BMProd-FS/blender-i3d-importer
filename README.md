@@ -9,6 +9,10 @@ modify, and (mostly) round-trip back into the Giants Editor through the Giants i
 
 ## Watch it in action
 
+<a href="https://youtu.be/C_X6HWwMUf8" target="_blank" rel="noopener"><img src="https://img.youtube.com/vi/C_X6HWwMUf8/maxresdefault.jpg" alt="What's new in the i3d Importer" width="48%"></a>
+
+▶ **New:** [What's New — faster import + load vehicle configs into Blender](https://youtu.be/C_X6HWwMUf8)
+
 <a href="https://youtu.be/GZyfNMfoyGQ" target="_blank" rel="noopener"><img src="https://img.youtube.com/vi/GZyfNMfoyGQ/maxresdefault.jpg" alt="i3d Importer trailer" width="48%"></a>   <a href="https://youtu.be/t-Kmea4K3zU" target="_blank" rel="noopener"><img src="https://img.youtube.com/vi/t-Kmea4K3zU/maxresdefault.jpg" alt="i3d Importer tutorial" width="48%"></a>
 
 ▶ [Trailer](https://youtu.be/GZyfNMfoyGQ) · [Tutorial](https://youtu.be/t-Kmea4K3zU)
@@ -60,7 +64,7 @@ modify, and (mostly) round-trip back into the Giants Editor through the Giants i
 - **Twin wheels** — additional wheels including their discs and both connector types (rimDual cage and hubDual clamps), with the connector geometry baked shader-exact.
 - **Shader-exact rims** — the FS rim shader sizes and dishes every rim procedurally from a `widthAndDiam` parameter; the preview bakes that deformation into the mesh (and *Prepare for Export* restores the pristine mesh + writes the parameter onto the export material, so GE and the game deform it themselves).
 - **Rim color preview** — recolor rims/weights per the vehicle's rimColor configurations; painting follows the shapes-file material slot names, so parts that stay black in-game stay black here too.
-- Known gap: the color configurations (base/design color palettes incl. the generated default colors) have no picker yet — coming as the next feature block.
+- **Color picker** — pick base, design and rim colors from a swatch grid, exactly like the in-game shop: the vehicle's own color options plus the game-generated default-color palette, each swatch showing its finish (glossy / metallic / matte). Works for vehicles and for colorable placeables (e.g. buildings). Colors referenced across configurations (`useBaseColor` / design color references) follow the current selection, so parts painted from the base color recolor along with it.
 
 ### N-panel workflow tools (`N` in the 3D viewport, tab "i3d Importer")
 
@@ -71,7 +75,7 @@ modify, and (mostly) round-trip back into the Giants Editor through the Giants i
 - **FS25 Invisible GE-objects** — show/hide all objects that were auto-hidden because they are invisible in the Giants Editor (e.g. collision volumes); reminds you to un-hide them before re-export
 - **Tree Season** - for imported trees, switch the seasonal leaf debug look (Summer / Autumn / Winter / Spring); appears only when a tree-branch material is present in the scene
 - **i3dMappings** - load a vehicle/placeable config XML and assign its `<i3dMapping>` ids to the imported objects, then view and edit a node's **Mapping ID** (written so the Giants exporter picks it up on re-export); also fills the exporter's *XML Config Files* list so you only pick the file once
-- **Store Config (preview)** - after loading the config XML: switch store configurations, load wheel configurations with tire brand and rim color, apply configuration-set presets; **Show All Config Parts** and **Default Config** reset buttons included
+- **Store Config (preview)** - after loading the config XML: switch store configurations, pick base/design/rim colors from a swatch grid, load wheel configurations with tire brand and rim color, apply configuration-set presets; **Show All Config Parts** and **Default Config** reset buttons included
 - **Prepare for Export** - one click gets the scene export-ready: shows snow/GE-invisible parts, resets the config preview, restores pristine (un-baked) wheel meshes, switches everything to the re-export materials and writes the rim/connector shader parameters onto them
 
 ### Convenience after import
@@ -85,7 +89,7 @@ modify, and (mostly) round-trip back into the Giants Editor through the Giants i
 
 - **Blender 5.1 or newer**
 - **Farming Simulator 25** (or FS22) installed locally — needed to resolve `$data/...` texture and shader paths. The add-on never modifies your game files.
-- **Operating system:** Windows is regularly tested and supported. Linux and macOS should work in principle since the decoder is pure Python and the add-on has no native binaries, but they are **untested** — please open an issue if you try them.
+- **Operating system:** Windows is regularly tested and supported. Linux and macOS should work in principle since the decoder is pure Python and the add-on has no native binaries, but they are **untested** — please open an issue if something doesn't work.
 - *Optional:* the [Parallax Node Extension](https://extensions.blender.org/add-ons/parallax-node/) for true parallax occlusion mapping in debug materials (a simpler bump-mapping fallback is used otherwise)
 
 ## Installation
@@ -112,6 +116,7 @@ modify, and (mostly) round-trip back into the Giants Editor through the Giants i
    - **Paths** — set **FS25 game data folder** to your FS25 installation root (the folder that contains the `data/` subfolder). Optionally set **Re-export output folder**.
    - **Import Defaults** — defaults for the per-import operator options (axis correction, auto-hide, debug materials, etc.).
    - **Terrain** — default LOD, base color for the terrain preview, and the comma-separated list of `<CombinedLayer>` names to load (up to 5; default covers ASPHALT, GRASS, MUD, FOREST_LEAVES, FOREST_GRASS).
+3. Check if you want to apply one or more of the *optional* Giants i3d Exporter [patches](blender_i3d_importer/patches/README.md). 
 
 ## How to use
 
@@ -152,11 +157,8 @@ Vehicle and placeable config XMLs reference nodes in the i3d through an `<i3dMap
 ## Known limitations
 
 - **Terrain is one-way.** The Giants Blender Exporter cannot emit a `<TerrainTransformGroup>`. The terrain mesh is for in-Blender preview / backgroundMesh-snapping only. The importer prints a WARNING in the log when terrain is loaded.
-- **Reference-node recursion.** Sub-i3ds referenced by a node are not loaded automatically; they remain as empties with the original `i3D_referenceFilename` custom property. The Giants exporter writes them back correctly on re-export, but only if you apply the `referenceChildPath`-patch (see above).
-- **Skinned-mesh armature leftover.** Re-exporting a skinned mesh leaves one empty `armature` transform group in the scenegraph (the Giants exporter does not collapse armatures). It is harmless and can be deleted in the Giants Editor; the joints themselves round-trip to their original place via "Child Of" constraints.
-- **i3dMappings on bones are not assigned.** When you load a config XML, mappings that target a skinned bone/joint (rare) are not assigned to any object; the importer lists them in a warning so nothing is lost silently. All mappings that target regular objects, including merge-group members, are assigned.
-- **Color configurations have no picker yet.** Base/design color palettes (including the game-generated default colors and `useBaseColor` references) are not offered in the Store Config panel yet — planned as the next feature block.
-- **Merge groups bound to distant nodes.** A rare merge-group pattern whose bind nodes live elsewhere in the tree (e.g. the detached coupler hoses on some sprayers) is not distributed yet and clumps at the origin; the game replaces those visuals at runtime anyway.
+- **Reference-nodes:** Sub-i3ds referenced by a node are not loaded automatically; they remain as empties with the original `i3D_referenceFilename` custom property. The Giants exporter writes them back correctly on re-export, **but only** if you apply the `referenceChildPath`-patch (see above).
+- **Skinned-mesh armature leftover.** Re-exporting a skinned mesh leaves one empty `zzz_armature` transform group in the scenegraph (the Giants exporter does not collapse armatures) at the end if the list. It is harmless and **can be deleted** in the Giants Editor; the joints themselves round-trip to their original place via "Child Of" constraints.
 
 ## License and attribution
 
