@@ -180,7 +180,7 @@ class FS25I3DImporterPreferences(AddonPreferences):
                     "vario1000.i3d), load it automatically: assign its i3dMappings "
                     "and load the store-config preview. Saves picking the file by "
                     "hand.",
-        default=False,
+        default=True,
     )
     add_sort_order_prefix_default: BoolProperty(
         name="Add GE sort-order prefix by default",
